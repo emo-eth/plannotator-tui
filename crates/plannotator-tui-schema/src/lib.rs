@@ -10,6 +10,7 @@
 pub mod anchor;
 pub mod annotation;
 pub mod datadir;
+pub mod inbox;
 pub mod resolve;
 pub mod source;
 pub mod version;

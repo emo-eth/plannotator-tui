@@ -17,6 +17,7 @@ similar = "3"
 toml = { version = "1", default-features = false, features = ["std", "serde", "parse", "display"] }
 unicode-width = "0.2"
 unicode-segmentation = "1.12"
+ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
 
 # Strict by default. Everything below is either a real defect class we want caught
 # or a pedantic lint that has already paid for itself in this codebase.

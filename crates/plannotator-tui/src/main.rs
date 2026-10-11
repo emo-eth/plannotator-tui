@@ -9,6 +9,17 @@ mod delivery;
 mod doc;
 mod export;
 mod herdr;
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+mod inbox;
 mod last;
 mod layout;
 mod srcmap;
