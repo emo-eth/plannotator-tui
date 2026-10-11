@@ -263,8 +263,8 @@ impl App {
 
     fn draw_compose(&self, frame: &mut Frame, title: &str) {
         let wrap_width = usize::from(COMPOSE_WIDTH.saturating_sub(3));
-        let (lines, cursor_row, cursor_col) = self.compose.wrapped(wrap_width);
-        let content_rows = lines.len().clamp(1, 8);
+        let (styled_lines, cursor_row, cursor_col) = self.compose.wrapped_with_selection(wrap_width);
+        let content_rows = styled_lines.len().clamp(1, 8);
         let height = content_rows as u16 + 2;
         let rect = self
             .float_origin(height, COMPOSE_WIDTH)
@@ -279,23 +279,59 @@ impl App {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(Color::Yellow))
-            .title(Span::styled(title.to_owned(), Style::new().dim()));
+            .title(Span::styled(title.to_owned(), Style::new().dim()))
+            .title_bottom(Span::styled(crate::app::editing::EDITING_HELP_SHORT, Style::new().dim()));
         let inner = boxed.inner(rect);
         frame.render_widget(boxed, rect);
         // Keep the cursor's row visible when the comment is taller than the box.
         let scroll = cursor_row.saturating_sub(content_rows - 1);
-        for (i, line) in lines.iter().skip(scroll).take(content_rows).enumerate() {
+        for (i, line_spans) in styled_lines.iter().skip(scroll).take(content_rows).enumerate() {
             let row = Rect {
                 x: inner.x + 1,
                 y: inner.y + i as u16,
                 width: inner.width.saturating_sub(1),
                 height: 1,
             };
-            frame.render_widget(Paragraph::new(Line::from(line.clone())), row);
+            let spans: Vec<Span> = line_spans
+                .iter()
+                .map(|(text, sel)| {
+                    if *sel {
+                        Span::styled(text.clone(), Style::new().bg(Color::Blue).fg(Color::White))
+                    } else {
+                        Span::raw(text.clone())
+                    }
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(Line::from(spans)), row);
         }
         let cursor_x = inner.x + 1 + cursor_col as u16;
         let cursor_y = inner.y + (cursor_row - scroll) as u16;
         frame.set_cursor_position((cursor_x.min(inner.right().saturating_sub(1)), cursor_y));
+
+        if self.compose.buffer.show_help() {
+            Self::draw_editing_help_overlay(frame, rect);
+        }
+    }
+
+    fn draw_editing_help_overlay(frame: &mut Frame, base: Rect) {
+        let lines: Vec<Line> =
+            crate::app::editing::EDITING_HELP_FULL.iter().map(|&l| Line::from(l)).collect();
+        let height = lines.len() as u16 + 2;
+        let width = 68.min(frame.area().width);
+        let x = base.x.min(frame.area().width.saturating_sub(width));
+        let y = if base.bottom() + height <= frame.area().height {
+            base.bottom()
+        } else {
+            base.y.saturating_sub(height)
+        };
+        let rect = Rect { x, y, width, height };
+        frame.render_widget(Clear, rect);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(Color::Cyan))
+            .title(Span::styled(" Editing Shortcuts (F1 or ^/ to close) ", Style::new().bold()));
+        frame.render_widget(Paragraph::new(lines).block(block), rect);
     }
 
     fn edit_origin(&self, height: u16, width: u16) -> Option<Rect> {
