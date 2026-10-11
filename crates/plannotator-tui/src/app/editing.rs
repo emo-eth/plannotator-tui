@@ -370,8 +370,8 @@ impl TextBuffer {
                 EditOutcome::Changed
             }
 
-            // Word jump left: Alt+Left, or Alt+b / Alt+B (ESC b)
-            KeyCode::Left if has_alt => {
+            // Word jump left: Alt+Left, Ctrl+Left, or Alt+b / Alt+B (ESC b)
+            KeyCode::Left if has_alt || (has_ctrl && !has_cmd) => {
                 self.move_word_left(has_shift);
                 EditOutcome::Changed
             }
@@ -380,8 +380,8 @@ impl TextBuffer {
                 EditOutcome::Changed
             }
 
-            // Word jump right: Alt+Right, or Alt+f / Alt+F (ESC f)
-            KeyCode::Right if has_alt => {
+            // Word jump right: Alt+Right, Ctrl+Right, or Alt+f / Alt+F (ESC f)
+            KeyCode::Right if has_alt || (has_ctrl && !has_cmd) => {
                 self.move_word_right(has_shift);
                 EditOutcome::Changed
             }
@@ -424,12 +424,12 @@ impl TextBuffer {
                 EditOutcome::Changed
             }
 
-            // Paragraph up/down: Alt+Up / Alt+Down
-            KeyCode::Up if has_alt => {
+            // Paragraph up/down: Alt+Up / Alt+Down / Ctrl+Up / Ctrl+Down
+            KeyCode::Up if has_alt || (has_ctrl && !has_cmd) => {
                 self.move_paragraph_prev(has_shift);
                 EditOutcome::Changed
             }
-            KeyCode::Down if has_alt => {
+            KeyCode::Down if has_alt || (has_ctrl && !has_cmd) => {
                 self.move_paragraph_next(has_shift);
                 EditOutcome::Changed
             }
@@ -454,8 +454,8 @@ impl TextBuffer {
                 EditOutcome::Changed
             }
 
-            // Delete word back: Alt+Backspace, Ctrl+w
-            KeyCode::Backspace if has_alt => {
+            // Delete word back: Alt+Backspace, Ctrl+Backspace, Ctrl+w
+            KeyCode::Backspace if (has_alt || has_ctrl) && !has_cmd => {
                 self.delete_word_back();
                 EditOutcome::Changed
             }
@@ -464,8 +464,8 @@ impl TextBuffer {
                 EditOutcome::Changed
             }
 
-            // Delete word forward: Alt+Delete, Alt+d
-            KeyCode::Delete if has_alt => {
+            // Delete word forward: Alt+Delete, Ctrl+Delete, Alt+d
+            KeyCode::Delete if (has_alt || has_ctrl) && !has_cmd => {
                 self.delete_word_forward();
                 EditOutcome::Changed
             }
@@ -599,19 +599,20 @@ impl TextBuffer {
 }
 
 /// Help text listing the editing keybindings.
-pub(crate) const EDITING_HELP_SHORT: &str = " ⌥←/→ word · ⌥⌫ del word · ⌘←/→ line · ^u/^k kill · ⌥↑/↓ para ";
+pub(crate) const EDITING_HELP_SHORT: &str =
+    " ⌥/Ctrl←/→ word · ⌥/Ctrl⌫ del word · ⌘←/→ or Home/End line · ^u/^k kill · ⌥/Ctrl↑/↓ para ";
 
 pub(crate) const EDITING_HELP_FULL: &[&str] = &[
-    "Editing Keybindings (macOS Standard):",
-    "  ⌥← / ⌥→ (or Alt+b / Alt+f) : Jump word backward / forward",
-    "  ⌥⌫ / ^w                    : Delete word backward",
-    "  ⌥Delete / Alt+d            : Delete word forward",
+    "Editing Keybindings (macOS: Alt/Cmd · Linux/Windows: Ctrl):",
+    "  ⌥← / ⌥→ / ^← / ^→ (Alt/Ctrl): Jump word backward / forward",
+    "  ⌥⌫ / ^⌫ / ^w               : Delete word backward",
+    "  ⌥Delete / ^Delete / Alt+d  : Delete word forward",
     "  ⌘← / Home / ^a             : Jump to line start",
     "  ⌘→ / End / ^e              : Jump to line end",
     "  ^u                         : Kill to line start",
     "  ^k                         : Kill to line end",
-    "  ⌥↑ / ⌥↓                    : Jump paragraph backward / forward",
-    "  Shift + ⌥ + Arrows         : Extend selection by word / paragraph",
+    "  ⌥↑ / ⌥↓ / ^↑ / ^↓          : Jump paragraph backward / forward",
+    "  Shift + ⌥/^ + Arrows       : Extend selection by word / paragraph",
     "  Shift + Arrows             : Extend selection by character / line",
     "  ⌘a                         : Select all",
     "Terminal Note: Terminal.app needs 'Use Option as Meta'.",
@@ -830,6 +831,56 @@ mod tests {
         assert_eq!(buf.cursor(), 15);
 
         buf.move_paragraph_prev(false);
+        assert_eq!(buf.cursor(), 0);
+    }
+
+    #[test]
+    fn test_ctrl_arrows_word_jump() {
+        let mut buf = TextBuffer::with_text("hello world again");
+        buf.set_cursor(0);
+        buf.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        assert_eq!(buf.cursor(), 5);
+        buf.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        assert_eq!(buf.cursor(), 11);
+        buf.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+        assert_eq!(buf.cursor(), 6);
+    }
+
+    #[test]
+    fn test_ctrl_backspace_and_ctrl_delete() {
+        let mut buf = TextBuffer::with_text("alpha beta gamma");
+        buf.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+        assert_eq!(buf.text(), "alpha beta ");
+
+        buf.set_cursor(0);
+        buf.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL));
+        assert_eq!(buf.text(), " beta ");
+    }
+
+    #[test]
+    fn test_shift_ctrl_arrows_extend_selection() {
+        let mut buf = TextBuffer::with_text("hello world");
+        buf.set_cursor(0);
+        let mut mods = KeyModifiers::CONTROL;
+        mods.insert(KeyModifiers::SHIFT);
+        buf.handle_key(KeyEvent::new(KeyCode::Right, mods));
+        assert_eq!(buf.selection_range(), Some((0, 5)));
+        assert_eq!(buf.cursor(), 5);
+
+        buf.insert('H');
+        assert_eq!(buf.text(), "H world");
+        assert_eq!(buf.cursor(), 1);
+        assert!(!buf.has_selection());
+    }
+
+    #[test]
+    fn test_ctrl_paragraph_movement() {
+        let mut buf = TextBuffer::with_text("para 1\nline 2\n\npara 2\nline 4");
+        buf.set_cursor(0);
+        buf.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        assert_eq!(buf.cursor(), 15);
+
+        buf.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
         assert_eq!(buf.cursor(), 0);
     }
 }
