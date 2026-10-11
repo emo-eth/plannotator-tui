@@ -4,6 +4,7 @@
 mod archive_view;
 mod compose;
 mod draw;
+pub(crate) mod editing;
 mod feedback;
 mod header;
 mod input;
