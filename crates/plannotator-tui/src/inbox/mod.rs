@@ -12,17 +12,22 @@ pub(crate) mod app;
 pub(crate) mod client;
 pub(crate) mod delivery;
 pub(crate) mod discovery;
+pub(crate) mod layout;
 pub(crate) mod questions;
 pub(crate) mod sse;
 pub(crate) mod ui;
 
+use std::io::stdout;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 #[allow(unused_imports)]
 pub(crate) use delivery::InboxDelivery;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{self, Event};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
+use ratatui::crossterm::execute;
 
 use self::app::InboxApp;
 use self::discovery::discover_inbox;
@@ -39,16 +44,20 @@ pub(crate) fn run_inbox(url_override: Option<&str>, snapshot: Option<(u16, u16)>
 
     let mut app = InboxApp::new(info)?;
     let mut terminal = ratatui::init();
+    execute!(stdout(), EnableMouseCapture)?;
+    let _ = execute!(stdout(), EnableBracketedPaste);
     let result = event_loop(&mut terminal, &mut app);
+    let _ = execute!(stdout(), DisableBracketedPaste);
+    let _ = execute!(stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
 
 /// Headless snapshot renderer for testing and proof captures.
 pub(crate) fn run_snapshot(info: &discovery::InboxConnectionInfo, cols: u16, rows: u16) -> Result<String> {
-    let app = InboxApp::new(info.clone())?;
+    let mut app = InboxApp::new(info.clone())?;
     let mut terminal = ratatui::Terminal::new(TestBackend::new(cols, rows))?;
-    terminal.draw(|frame| ui::draw(frame, &app))?;
+    terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
     let buffer = terminal.backend().buffer();
     let mut lines = Vec::new();
@@ -77,28 +86,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut InboxApp) -> Re
         }
 
         if event::poll(Duration::from_millis(50))? {
-            let mut handle_event = |ev: Event| -> Result<()> {
-                match ev {
-                    Event::Key(key) if key.kind != event::KeyEventKind::Release => {
-                        app.handle_key(key)?;
-                        dirty = true;
-                    }
-                    Event::Paste(text) => {
-                        if app.reply_mode {
-                            for c in text.chars() {
-                                app.reply_buffer.insert(c);
-                            }
-                            dirty = true;
-                        }
-                    }
-                    _ => {}
-                }
-                Ok(())
-            };
             let first_ev = event::read()?;
-            handle_event(first_ev)?;
+            app.handle_event(&first_ev)?;
+            dirty = true;
             while event::poll(Duration::ZERO)? {
-                handle_event(event::read()?)?;
+                let ev = event::read()?;
+                app.handle_event(&ev)?;
             }
         }
     }

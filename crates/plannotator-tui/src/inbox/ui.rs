@@ -4,26 +4,49 @@
 
 use plannotator_tui_schema::inbox::{InboxSectionId, QuestionKind};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{ActivePane, InboxApp};
+use super::layout::compute_layout;
 
-pub(crate) fn draw(frame: &mut Frame, app: &InboxApp) {
+fn fit(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if out.width() + ch_w + 1 > width {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+pub(crate) fn draw(frame: &mut Frame, app: &mut InboxApp) {
     let area = frame.area();
+    app.last_area = area;
+    app.geometry.area = area;
 
-    // Vertical split: Header (1), Main (Min 5), Bottom (1 or 5)
-    let bottom_height = if app.reply_mode { 5 } else { 1 };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(5), Constraint::Length(bottom_height)])
-        .split(area);
+    let layout = compute_layout(area, app.split_ratio, app.reply_mode);
+    app.geometry.threads_rect = layout.threads;
+    app.geometry.detail_rect = layout.detail;
+    app.geometry.divider_col = layout.divider_col;
+    app.geometry.thread_rows.clear();
 
-    draw_header(frame, chunks[0], app);
-    draw_main(frame, chunks[1], app);
-    draw_bottom(frame, chunks[2], app);
+    draw_header(frame, layout.header, app);
+    draw_threads_pane(frame, layout.threads, app);
+    draw_detail_pane(frame, layout.detail, app);
+    draw_bottom(frame, layout.footer, app);
 
     if app.show_help {
         draw_help_overlay(frame, area);
@@ -49,28 +72,13 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &InboxApp) {
 
     let help_hint = Span::styled(" [?] Help  [q] Quit ", Style::default().fg(Color::Gray));
 
-    let line = Line::from(vec![
-        title,
-        conn_dot,
-        server_info,
-        Span::raw(" ".repeat(
-            area.width.saturating_sub(35 + app.client.base_url.len() as u16 + help_hint.width() as u16)
-                as usize,
-        )),
-        help_hint,
-    ]);
+    let left_width = title.width() + conn_dot.width() + server_info.width();
+    let right_width = help_hint.width();
+    let spaces = (area.width as usize).saturating_sub(left_width + right_width);
+
+    let line = Line::from(vec![title, conn_dot, server_info, Span::raw(" ".repeat(spaces)), help_hint]);
 
     frame.render_widget(Paragraph::new(line), area);
-}
-
-fn draw_main(frame: &mut Frame, area: Rect, app: &InboxApp) {
-    let horizontal_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(area);
-
-    draw_threads_pane(frame, horizontal_chunks[0], app);
-    draw_detail_pane(frame, horizontal_chunks[1], app);
 }
 
 fn section_style(id: InboxSectionId) -> Style {
@@ -84,7 +92,7 @@ fn section_style(id: InboxSectionId) -> Style {
     }
 }
 
-fn draw_threads_pane(frame: &mut Frame, area: Rect, app: &InboxApp) {
+fn draw_threads_pane(frame: &mut Frame, area: Rect, app: &mut InboxApp) {
     let is_focused = app.active_pane == ActivePane::Threads;
     let border_style =
         if is_focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
@@ -133,10 +141,26 @@ fn draw_threads_pane(frame: &mut Frame, area: Rect, app: &InboxApp) {
         } else {
             Span::raw("   ")
         };
+        let prefix_width = 3usize;
 
-        let project_tag =
-            Span::styled(format!("[{}] ", item.summary.project.name), Style::default().fg(Color::Magenta));
         let is_unread = item.summary.unread;
+        let unread_dot = if is_unread {
+            Span::styled("\u{25cf} ", Style::default().fg(Color::LightCyan))
+        } else {
+            Span::raw("  ")
+        };
+        let unread_width = 2usize;
+
+        let tag_str = format!("[{}] ", item.summary.project.name);
+        let tag_width = tag_str.width();
+        let project_tag = Span::styled(tag_str, Style::default().fg(Color::Magenta));
+
+        let used = prefix_width + unread_width + tag_width;
+        let available = (inner.width as usize).saturating_sub(used);
+
+        let subj_text = item.summary.subject.as_deref().unwrap_or("Untitled");
+        let fitted = fit(subj_text, available);
+
         let subject_style = if is_selected {
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
         } else if is_unread {
@@ -144,16 +168,9 @@ fn draw_threads_pane(frame: &mut Frame, area: Rect, app: &InboxApp) {
         } else {
             Style::default().fg(Color::Gray)
         };
+        let subject = Span::styled(fitted, subject_style);
 
-        let unread_dot = if is_unread {
-            Span::styled("\u{25cf} ", Style::default().fg(Color::LightCyan))
-        } else {
-            Span::raw("  ")
-        };
-
-        let subj_text = item.summary.subject.as_deref().unwrap_or("Untitled");
-        let subject = Span::styled(subj_text, subject_style);
-
+        let start_line = lines.len();
         lines.push(Line::from(vec![prefix, unread_dot, project_tag, subject]));
 
         // Subline: Author · decisions/questions status
@@ -170,6 +187,9 @@ fn draw_threads_pane(frame: &mut Frame, area: Rect, app: &InboxApp) {
             ),
         ]);
         lines.push(subline);
+
+        let row_rect = Rect::new(inner.x, inner.y + start_line as u16, inner.width, 2);
+        app.geometry.thread_rows.push((row_rect, idx));
     }
 
     let paragraph = Paragraph::new(lines);
@@ -238,14 +258,13 @@ fn draw_detail_pane(frame: &mut Frame, area: Rect, app: &InboxApp) {
         let time_info =
             Span::styled(format!(" {host_info}{}", msg.created_at), Style::default().fg(Color::DarkGray));
 
+        let used = 3 + author_tag.width() + time_info.width();
+        let dashes = " \u{2500}".repeat((inner.width as usize).saturating_sub(used) / 2);
         content_lines.push(Line::from(vec![
             Span::styled("\u{2500}\u{2500} ", Style::default().fg(Color::DarkGray)),
             author_tag,
             time_info,
-            Span::styled(
-                " \u{2500}".repeat(inner.width.saturating_sub(40) as usize),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(dashes, Style::default().fg(Color::DarkGray)),
         ]));
         content_lines.push(Line::raw(""));
 
@@ -289,17 +308,17 @@ fn draw_detail_pane(frame: &mut Frame, area: Rect, app: &InboxApp) {
                 Style::default().fg(Color::Blue)
             };
 
+            let prompt_tag = Span::styled(
+                &card.question.prompt,
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            );
+            let card_used = 13 + prompt_tag.width() + 1;
+            let card_dashes = " \u{2500}".repeat((inner.width as usize).saturating_sub(card_used) / 2);
+
             content_lines.push(Line::from(vec![
                 Span::styled("\u{250c}\u{2500} Question: ", card_border),
-                Span::styled(
-                    &card.question.prompt,
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    " \u{2500}"
-                        .repeat(inner.width.saturating_sub(card.question.prompt.len() as u16 + 20) as usize),
-                    card_border,
-                ),
+                prompt_tag,
+                Span::styled(card_dashes, card_border),
                 Span::styled("\u{2510}", card_border),
             ]));
 
@@ -434,7 +453,7 @@ fn draw_bottom(frame: &mut Frame, area: Rect, app: &InboxApp) {
         frame.render_widget(p, inner);
     } else {
         let hints = Span::styled(
-            " [j/k] Navigate  [Tab] Pane  [Space/Enter] Pick  [r] Reply  [x] Resolve  [?] Help ",
+            " [j/k] Navigate  [Tab] Pane  [Space/Enter] Pick  [Ctrl+←/→, </>] Resize  [=] Reset  [r] Reply  [x] Resolve  [?] Help ",
             Style::default().fg(Color::Gray),
         );
 
@@ -450,7 +469,7 @@ fn draw_bottom(frame: &mut Frame, area: Rect, app: &InboxApp) {
 }
 
 fn draw_help_overlay(frame: &mut Frame, area: Rect) {
-    let popup_width = 62.min(area.width.saturating_sub(4));
+    let popup_width = 78.min(area.width.saturating_sub(4));
     let popup_height = 18.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -475,6 +494,10 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         ("j / k, \u{2193} / \u{2191}", "Navigate threads (left) or choices (right)"),
         ("Tab / Shift-Tab", "Switch focus between threads and detail pane"),
         ("Space / Enter", "Select / toggle choice on active question card"),
+        ("Ctrl+← / Ctrl+→, < / >", "Resize split between threads and detail panes"),
+        ("=", "Reset split to default (35%)"),
+        ("Mouse Drag", "Drag vertical divider between panes to resize split"),
+        ("Mouse Wheel / Click", "Scroll pane under cursor / select thread row"),
         ("r", "Compose free-text reply to asking agent"),
         ("x", "Toggle resolve status on current thread"),
         ("a", "Open attachment in annotator for line comments"),
@@ -486,7 +509,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     for (key, desc) in help_items {
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {key:<18}"),
+                format!("  {key:<25}"),
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
             Span::styled(desc, Style::default().fg(Color::White)),

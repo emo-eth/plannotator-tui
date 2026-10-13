@@ -12,10 +12,17 @@ use anyhow::Result;
 use plannotator_tui_schema::inbox::{
     InboxListRow, InboxSectionId, InboxServerEvent, ListModel, PickItem, ReplyQuestionRef, ThreadModel,
 };
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 
 use super::client::InboxClient;
 use super::discovery::InboxConnectionInfo;
+use super::layout::{
+    DEFAULT_SPLIT_RATIO, adjust_split_ratio, compute_layout, drag_to_ratio, load_split_ratio,
+    save_split_ratio,
+};
 use super::questions::{QuestionCard, QuestionCardAction};
 use super::sse::spawn_sse_listener;
 use crate::app::editing::TextBuffer;
@@ -24,6 +31,15 @@ use crate::app::editing::TextBuffer;
 pub(crate) enum ActivePane {
     Threads,
     Detail,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InboxGeometry {
+    pub(crate) area: Rect,
+    pub(crate) threads_rect: Rect,
+    pub(crate) detail_rect: Rect,
+    pub(crate) divider_col: u16,
+    pub(crate) thread_rows: Vec<(Rect, usize)>,
 }
 
 #[allow(dead_code)]
@@ -52,6 +68,11 @@ pub(crate) struct InboxApp {
     pub(crate) active_pane: ActivePane,
     pub(crate) scroll_offset: usize,
 
+    pub(crate) split_ratio: f32,
+    pub(crate) dragging_divider: bool,
+    pub(crate) geometry: InboxGeometry,
+    pub(crate) last_area: Rect,
+
     pub(crate) reply_mode: bool,
     pub(crate) reply_buffer: TextBuffer,
 
@@ -74,6 +95,8 @@ impl InboxApp {
         let sse_stop = Arc::new(AtomicBool::new(false));
         spawn_sse_listener(client.base_url.clone(), list.cursor, sse_tx, Arc::clone(&sse_stop));
 
+        let split_ratio = load_split_ratio().unwrap_or(DEFAULT_SPLIT_RATIO);
+
         let mut app = Self {
             client,
             sse_rx,
@@ -90,6 +113,11 @@ impl InboxApp {
 
             active_pane: ActivePane::Threads,
             scroll_offset: 0,
+
+            split_ratio,
+            dragging_divider: false,
+            geometry: InboxGeometry::default(),
+            last_area: Rect::default(),
 
             reply_mode: false,
             reply_buffer: TextBuffer::default(),
@@ -185,6 +213,78 @@ impl InboxApp {
         }
     }
 
+    /// Handle unified crossterm event.
+    pub(crate) fn handle_event(&mut self, event: &Event) -> Result<()> {
+        match event {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                self.handle_key(*key)?;
+            }
+            Event::Mouse(mouse) => {
+                self.handle_mouse(*mouse)?;
+            }
+            Event::Resize(cols, rows) => {
+                self.handle_resize(*cols, *rows);
+            }
+            Event::Paste(text) => {
+                if self.reply_mode {
+                    for c in text.chars() {
+                        self.reply_buffer.insert(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn handle_resize(&mut self, cols: u16, rows: u16) {
+        self.last_area = Rect::new(0, 0, cols, rows);
+        let layout = compute_layout(self.last_area, self.split_ratio, self.reply_mode);
+        self.geometry.area = self.last_area;
+        self.geometry.threads_rect = layout.threads;
+        self.geometry.detail_rect = layout.detail;
+        self.geometry.divider_col = layout.divider_col;
+    }
+
+    pub(crate) fn select_next_thread(&mut self) {
+        if !self.flattened_threads.is_empty() && self.selected_thread_idx + 1 < self.flattened_threads.len() {
+            self.selected_thread_idx += 1;
+            self.load_thread(self.selected_thread_idx);
+        }
+    }
+
+    pub(crate) fn select_prev_thread(&mut self) {
+        if self.selected_thread_idx > 0 {
+            self.selected_thread_idx -= 1;
+            self.load_thread(self.selected_thread_idx);
+        }
+    }
+
+    pub(crate) fn adjust_split(&mut self, delta_cols: i16) {
+        let width = if self.geometry.area.width > 0 {
+            self.geometry.area.width
+        } else if self.last_area.width > 0 {
+            self.last_area.width
+        } else {
+            160
+        };
+        self.split_ratio = adjust_split_ratio(self.split_ratio, delta_cols, width);
+        save_split_ratio(self.split_ratio);
+        let layout = compute_layout(self.geometry.area, self.split_ratio, self.reply_mode);
+        self.geometry.threads_rect = layout.threads;
+        self.geometry.detail_rect = layout.detail;
+        self.geometry.divider_col = layout.divider_col;
+    }
+
+    pub(crate) fn reset_split(&mut self) {
+        self.split_ratio = DEFAULT_SPLIT_RATIO;
+        save_split_ratio(self.split_ratio);
+        let layout = compute_layout(self.geometry.area, self.split_ratio, self.reply_mode);
+        self.geometry.threads_rect = layout.threads;
+        self.geometry.detail_rect = layout.detail;
+        self.geometry.divider_col = layout.divider_col;
+    }
+
     /// Handle keyboard input.
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         // Clear old status message after 4s
@@ -216,6 +316,24 @@ impl InboxApp {
                     self.reply_buffer.handle_key(key);
                 }
             }
+            return Ok(());
+        }
+
+        // Global split resizing
+        if (key.code == KeyCode::Left && key.modifiers.contains(KeyModifiers::CONTROL))
+            || key.code == KeyCode::Char('<')
+        {
+            self.adjust_split(-2);
+            return Ok(());
+        }
+        if (key.code == KeyCode::Right && key.modifiers.contains(KeyModifiers::CONTROL))
+            || key.code == KeyCode::Char('>')
+        {
+            self.adjust_split(2);
+            return Ok(());
+        }
+        if key.code == KeyCode::Char('=') {
+            self.reset_split();
             return Ok(());
         }
 
@@ -273,18 +391,10 @@ impl InboxApp {
     fn handle_threads_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
-                if !self.flattened_threads.is_empty()
-                    && self.selected_thread_idx + 1 < self.flattened_threads.len()
-                {
-                    self.selected_thread_idx += 1;
-                    self.load_thread(self.selected_thread_idx);
-                }
+                self.select_next_thread();
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.selected_thread_idx > 0 {
-                    self.selected_thread_idx -= 1;
-                    self.load_thread(self.selected_thread_idx);
-                }
+                self.select_prev_thread();
             }
             KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => {
                 self.active_pane = ActivePane::Detail;
@@ -381,6 +491,94 @@ impl InboxApp {
         }
     }
 
+    /// Handle mouse input.
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let div = self.geometry.divider_col;
+                let within_div =
+                    mouse.column >= div.saturating_sub(1) && mouse.column <= div.saturating_add(1);
+                let in_main_rows = mouse.row >= self.geometry.threads_rect.y
+                    && mouse.row < self.geometry.threads_rect.bottom();
+                if within_div && in_main_rows {
+                    self.dragging_divider = true;
+                    return Ok(());
+                }
+
+                let hit = self.geometry.thread_rows.iter().find(|(rect, _)| {
+                    mouse.column >= rect.x
+                        && mouse.column < rect.right()
+                        && mouse.row >= rect.y
+                        && mouse.row < rect.bottom()
+                });
+                if let Some((_, idx)) = hit {
+                    if *idx != self.selected_thread_idx {
+                        self.selected_thread_idx = *idx;
+                        self.load_thread(*idx);
+                    }
+                    self.active_pane = ActivePane::Threads;
+                    return Ok(());
+                }
+
+                let in_detail = mouse.column >= self.geometry.detail_rect.x
+                    && mouse.column < self.geometry.detail_rect.right()
+                    && mouse.row >= self.geometry.detail_rect.y
+                    && mouse.row < self.geometry.detail_rect.bottom();
+                if in_detail {
+                    self.active_pane = ActivePane::Detail;
+                    return Ok(());
+                }
+
+                let in_threads = mouse.column >= self.geometry.threads_rect.x
+                    && mouse.column < self.geometry.threads_rect.right()
+                    && mouse.row >= self.geometry.threads_rect.y
+                    && mouse.row < self.geometry.threads_rect.bottom();
+                if in_threads {
+                    self.active_pane = ActivePane::Threads;
+                    return Ok(());
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.dragging_divider {
+                    let total_width = if self.geometry.area.width > 0 {
+                        self.geometry.area.width
+                    } else if self.last_area.width > 0 {
+                        self.last_area.width
+                    } else {
+                        160
+                    };
+                    self.split_ratio = drag_to_ratio(mouse.column, total_width);
+                    let layout = compute_layout(self.geometry.area, self.split_ratio, self.reply_mode);
+                    self.geometry.threads_rect = layout.threads;
+                    self.geometry.detail_rect = layout.detail;
+                    self.geometry.divider_col = layout.divider_col;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.dragging_divider {
+                    self.dragging_divider = false;
+                    save_split_ratio(self.split_ratio);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if mouse.column < self.geometry.divider_col {
+                    self.select_next_thread();
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_add(3);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if mouse.column < self.geometry.divider_col {
+                    self.select_prev_thread();
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn submit_reply(&mut self) -> Result<()> {
         let Some(detail) = &self.current_thread else { return Ok(()) };
         let Some(last_msg) = detail.thread.messages.last() else { return Ok(()) };
@@ -470,6 +668,59 @@ impl Drop for InboxApp {
 mod tests {
     use super::*;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn test_resize_event_triggers_relayout() -> Result<()> {
+        let info = InboxConnectionInfo {
+            url: "http://127.0.0.1:0".to_owned(),
+            server_session: "test".to_owned(),
+            config_path: PathBuf::new(),
+        };
+        let mut app = InboxApp::new(info)?;
+        app.handle_event(&Event::Resize(160, 60))?;
+        assert_eq!(app.geometry.area, Rect::new(0, 0, 160, 60));
+        assert_eq!(app.geometry.threads_rect.width, 56);
+        assert_eq!(app.geometry.detail_rect.width, 104);
+
+        app.handle_event(&Event::Resize(80, 24))?;
+        assert_eq!(app.geometry.area, Rect::new(0, 0, 80, 24));
+        assert_eq!(app.geometry.threads_rect.width, 28);
+        assert_eq!(app.geometry.detail_rect.width, 52);
+        Ok(())
+    }
+
+    #[test]
+    fn test_keyboard_resize_and_reset() -> Result<()> {
+        let info = InboxConnectionInfo {
+            url: "http://127.0.0.1:0".to_owned(),
+            server_session: "test".to_owned(),
+            config_path: PathBuf::new(),
+        };
+        let mut app = InboxApp::new(info)?;
+        app.handle_event(&Event::Resize(160, 60))?;
+        assert_eq!(app.geometry.threads_rect.width, 56);
+
+        // Move right with '>'
+        app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE))?;
+        assert_eq!(app.geometry.threads_rect.width, 58);
+
+        // Move left with '<'
+        app.handle_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE))?;
+        assert_eq!(app.geometry.threads_rect.width, 56);
+
+        // Move with Ctrl+Left / Ctrl+Right
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))?;
+        assert_eq!(app.geometry.threads_rect.width, 58);
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL))?;
+        assert_eq!(app.geometry.threads_rect.width, 56);
+
+        // Reset with '='
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))?;
+        assert_eq!(app.geometry.threads_rect.width, 58);
+        app.handle_key(KeyEvent::new(KeyCode::Char('='), KeyModifiers::NONE))?;
+        assert_eq!(app.geometry.threads_rect.width, 56);
+        Ok(())
+    }
 
     #[test]
     fn test_live_proof_flow() -> Result<()> {
