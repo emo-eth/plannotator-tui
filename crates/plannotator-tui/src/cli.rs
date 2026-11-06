@@ -41,7 +41,9 @@ const USAGE: &str = "usage:
   plannotator-tui herdr terminal [--lines N] [--placement P] [--deliver-to <pane>] [--print]
   plannotator-tui herdr pane
   plannotator-tui last [--host claude|codex|pi|omp|copilot|droid|hermes|opencode|cmd|agy] [--pid N] [--session <transcript>]
-                       [--session-id <id>] [--stdin] [--print] [--pick N] [--newest]";
+                       [--session-id <id>] [--stdin] [--print] [--pick N] [--newest]
+  plannotator-tui inbox [--url <url>] [--snapshot [cols rows]]
+  plannotator-tui herdr inbox [--placement overlay|split|popup]";
 
 /// Width the document gets when nothing else is known: gutter + rail + gap subtracted.
 fn doc_width(cols: u16) -> usize {
@@ -135,7 +137,7 @@ fn wants_decision(args: &[String]) -> bool {
     let decision_flag = |arg: &String| gate::FLAGS.contains(&arg.as_str());
     match args.first() {
         Some(first) if decision_flag(first) => true,
-        Some(first) if first.starts_with('-') || matches!(first.as_str(), "config" | "herdr" | "last") => {
+        Some(first) if first.starts_with('-') || matches!(first.as_str(), "config" | "herdr" | "last" | "inbox") => {
             false
         }
         Some(_) => args.iter().skip(1).any(decision_flag),
@@ -190,6 +192,7 @@ fn tool(args: &[String]) -> Result<()> {
         Some("config") => show_config(),
         Some("herdr") => herdr_command(args.get(1..).unwrap_or_default()),
         Some("last") => last_command(args.get(1..).unwrap_or_default()),
+        Some("inbox") => inbox_command(args.get(1..).unwrap_or_default()),
         Some(flag) if flag.starts_with("--") => anyhow::bail!("unknown flag {flag}\n{USAGE}"),
         Some(_) => interactive(&path(0)?),
         None => anyhow::bail!(USAGE),
@@ -271,6 +274,9 @@ fn herdr_launch(args: &[String]) -> Result<()> {
     if sub == Some("terminal") {
         return herdr_terminal(args.get(1..).unwrap_or_default());
     }
+    if sub == Some("inbox") {
+        return herdr_inbox(args.get(1..).unwrap_or_default());
+    }
     if !matches!(sub, Some("open" | "last")) {
         anyhow::bail!(USAGE);
     }
@@ -324,6 +330,65 @@ fn herdr_launch(args: &[String]) -> Result<()> {
         plan(&env, &config, open, &cwd)?
     };
     run(&env, &launch)
+}
+
+
+fn herdr_inbox(args: &[String]) -> Result<()> {
+    use crate::config::Placement;
+    let mut placement: Option<Placement> = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--placement" => {
+                let value = rest.next().context("--placement needs a value")?;
+                placement = Some(value.parse()?);
+            }
+            flag if flag.starts_with("--") => anyhow::bail!("unknown flag {flag}\n{USAGE}"),
+            extra => anyhow::bail!("unexpected argument {extra:?}\n{USAGE}"),
+        }
+    }
+    let env = HerdrEnv::from_env();
+    let config = Config::load()?;
+    let placement = placement.unwrap_or(config.herdr.placement);
+    let plugin = env.plugin_id.clone().unwrap_or_else(|| "plannotator-tui".to_owned());
+    let cmd_args = vec![
+        "plugin".to_owned(),
+        "pane".to_owned(),
+        "open".to_owned(),
+        "--plugin".to_owned(),
+        plugin,
+        "--entrypoint".to_owned(),
+        "inbox".to_owned(),
+        "--placement".to_owned(),
+        placement.to_string(),
+    ];
+    let status = std::process::Command::new(&env.bin).args(&cmd_args).status()?;
+    if !status.success() {
+        anyhow::bail!("herdr plugin pane open failed with {status}");
+    }
+    Ok(())
+}
+
+fn inbox_command(args: &[String]) -> Result<()> {
+    let mut url = None;
+    let mut snapshot = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--url" => {
+                let val = rest.next().context("--url needs a value")?;
+                url = Some(val.clone());
+            }
+            "--snapshot" => {
+                let cols: u16 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(140);
+                let rows: u16 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(40);
+                snapshot = Some((cols, rows));
+            }
+            flag if flag.starts_with("--") => anyhow::bail!("unknown flag {flag}\n{USAGE}"),
+            extra => anyhow::bail!("unexpected argument {extra:?}\n{USAGE}"),
+        }
+    }
+    crate::inbox::run_inbox(url.as_deref(), snapshot)
 }
 
 /// `plannotator-tui herdr terminal [--lines N] [--placement P] [--deliver-to PANE] [--print]`:

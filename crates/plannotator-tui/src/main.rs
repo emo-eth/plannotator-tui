@@ -12,6 +12,17 @@ mod export;
 mod file_search;
 mod gate;
 mod herdr;
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+mod inbox;
 mod keys;
 mod last;
 mod layout;

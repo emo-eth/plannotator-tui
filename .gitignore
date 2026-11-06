@@ -1,3 +1,8 @@
 /target
 /herdr/bin/
 *.annotations.json.tmp
+.herdr-ticket
+GOAL.md
+TICKET.md
+*.typescript
+screenshot.txt

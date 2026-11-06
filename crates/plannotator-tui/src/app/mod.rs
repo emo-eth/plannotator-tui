@@ -7,6 +7,7 @@ mod compose;
 mod disk;
 mod draw;
 mod editor;
+pub(crate) mod editing;
 mod feedback;
 mod file_search;
 mod header;
