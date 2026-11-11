@@ -16,6 +16,7 @@ use ratatui::crossterm::event::{
 use super::send::SendState;
 use super::{App, Mode};
 use crate::delivery::{Delivery, Discard, HerdrAgent};
+use crate::theme::palette;
 
 /// A fresh, empty data directory for one test. `App::open` resolves the real one, and a
 /// successful send archives into it, so every app under test is pointed here instead:
@@ -564,6 +565,67 @@ fn pasting_into_the_comment_box_keeps_newlines() {
     app.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE)).expect("save");
     let placed = app.open.store.placed();
     assert_eq!(placed.last().expect("annotation").annotation.body, "pasted one\npasted two");
+}
+
+#[test]
+fn f1_and_ctrl_slash_toggle_the_editing_keys_overlay() {
+    let mut app = app(Box::new(Discard));
+    draw(&mut app);
+    app.handle_event(&click_at(5, 3)).expect("click");
+    app.handle_event(&click_at(5, 3)).expect("double click");
+    press_char(&mut app, 'c');
+    let rows = draw(&mut app);
+    assert!(rows.iter().any(|r| r.contains("f1 all keys")), "the box hints at the keys: {rows:?}");
+    assert!(!rows.iter().any(|r| r.contains("editing keys")));
+    app.handle_event(&key(KeyCode::F(1), KeyModifiers::NONE)).expect("f1");
+    let rows = draw(&mut app);
+    assert!(rows.iter().any(|r| r.contains("editing keys")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("select all")), "{rows:?}");
+    app.handle_event(&key(KeyCode::Char('/'), KeyModifiers::CONTROL)).expect("ctrl+/");
+    assert!(!draw(&mut app).iter().any(|r| r.contains("editing keys")));
+    // Without the kitty protocol Ctrl+/ is the byte 0x1f, which crossterm reads as Ctrl+7.
+    app.handle_event(&key(KeyCode::Char('7'), KeyModifiers::CONTROL)).expect("legacy ctrl+/");
+    assert!(draw(&mut app).iter().any(|r| r.contains("editing keys")));
+    press_char(&mut app, 'x');
+    app.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE)).expect("save");
+    assert_eq!(app.open.store.placed().last().expect("annotation").annotation.body, "x");
+}
+
+#[test]
+fn a_selection_in_the_comment_box_is_drawn_highlighted() {
+    let mut app = app(Box::new(Discard));
+    draw(&mut app);
+    app.handle_event(&click_at(5, 3)).expect("click");
+    app.handle_event(&click_at(5, 3)).expect("double click");
+    press_char(&mut app, 'c');
+    for c in "hello world".chars() {
+        press_char(&mut app, c);
+    }
+    app.handle_event(&key(KeyCode::Left, KeyModifiers::SHIFT | KeyModifiers::ALT)).expect("select word");
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("terminal");
+    terminal.draw(|frame| app.draw(frame)).expect("draw");
+    let buffer = terminal.backend().buffer();
+    let symbols: Vec<Vec<&str>> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .filter_map(|x| buffer.cell((x, y)))
+                .map(ratatui::buffer::Cell::symbol)
+                .collect()
+        })
+        .collect();
+    let (y, x) = symbols
+        .iter()
+        .enumerate()
+        .find_map(|(y, row)| {
+            let x = (0..row.len()).find(|&x| row[x..].concat().starts_with("hello world"))?;
+            Some((y as u16, x as u16))
+        })
+        .expect("the comment is on screen");
+    let style = |dx: u16| buffer.cell((x + dx, y)).expect("cell").style();
+    let (plain, highlighted) = (style(0), style(0).patch(palette().selection));
+    assert_ne!(plain, highlighted);
+    assert!((6..11).all(|dx| style(dx) == highlighted), "the selected word is highlighted");
+    assert!((0..6).all(|dx| style(dx) == plain), "the rest is plain");
 }
 
 #[test]

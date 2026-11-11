@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
+use super::editing::{EDITING_HELP, EDITING_HINT};
 use super::{App, Focus, GUTTER, Geometry, Mode, TOOLBAR, glyph, label};
 use crate::gate::Gate;
 use crate::keys::Action;
@@ -24,6 +25,8 @@ const TREE_WIDTH: u16 = 28;
 /// Below this the tree is hidden unless toggled on; Tab still reaches it.
 pub(super) const TREE_MIN_TOTAL_WIDTH: u16 = 120;
 const COMPOSE_WIDTH: u16 = 48;
+/// The editing keys overlay: the widest row plus borders.
+const EDITING_HELP_WIDTH: u16 = 72;
 
 fn accent(kind: Kind) -> Color {
     match kind {
@@ -302,23 +305,56 @@ impl App {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(palette().comment))
-            .title(Span::styled(title.to_owned(), Style::new().dim()));
+            .title(Span::styled(title.to_owned(), Style::new().dim()))
+            .title_bottom(Span::styled(EDITING_HINT, Style::new().dim()));
         let inner = boxed.inner(rect);
         frame.render_widget(boxed, rect);
         // Keep the cursor's row visible when the comment is taller than the box.
         let scroll = cursor_row.saturating_sub(content_rows - 1);
-        for (i, line) in lines.iter().skip(scroll).take(content_rows).enumerate() {
+        for (i, runs) in lines.iter().skip(scroll).take(content_rows).enumerate() {
             let row = Rect {
                 x: inner.x + 1,
                 y: inner.y + i as u16,
                 width: inner.width.saturating_sub(1),
                 height: 1,
             };
-            frame.render_widget(Paragraph::new(Line::from(line.clone())), row);
+            let line: Line = runs
+                .iter()
+                .map(|(text, selected)| {
+                    let style = if *selected { palette().selection } else { Style::new() };
+                    Span::styled(text.as_str(), style)
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(line), row);
         }
         let cursor_x = inner.x + 1 + cursor_col as u16;
         let cursor_y = inner.y + (cursor_row - scroll) as u16;
         frame.set_cursor_position((cursor_x.min(inner.right().saturating_sub(1)), cursor_y));
+        if self.compose.show_help {
+            self.draw_editing_help(frame, rect);
+        }
+    }
+
+    /// The editing keys, under the compose box when they fit there, else above it.
+    fn draw_editing_help(&self, frame: &mut Frame, compose: Rect) {
+        let area = self.viewport(frame.area());
+        let width = EDITING_HELP_WIDTH.min(area.width);
+        let height = (EDITING_HELP.len() as u16 + 2).min(area.height);
+        let x = compose.x.min(area.right().saturating_sub(width));
+        let y = if compose.bottom() + height <= area.bottom() {
+            compose.bottom()
+        } else {
+            compose.y.saturating_sub(height).max(area.y)
+        };
+        let rect = Rect { x, y, width, height };
+        frame.render_widget(Clear, rect);
+        let boxed = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(palette().accent))
+            .title(Span::styled(" editing keys \u{b7} f1 or ^/ closes ", Style::new().dim()));
+        let lines: Vec<Line> = EDITING_HELP.iter().map(|&row| Line::from(row)).collect();
+        frame.render_widget(Paragraph::new(lines).block(boxed), rect);
     }
 
     fn edit_origin(&self, height: u16, width: u16) -> Option<Rect> {

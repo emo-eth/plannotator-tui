@@ -6,6 +6,7 @@ mod archive_view;
 mod compose;
 mod disk;
 mod draw;
+mod editing;
 mod editor;
 mod feedback;
 mod file_search;
