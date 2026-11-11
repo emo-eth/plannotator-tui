@@ -107,6 +107,28 @@ dimmed. The keys also work without opening the menu.
 
 These are the defaults; every key can be rebound under `[keys]` (see [Keys](#keys)).
 
+### Inbox
+
+`plannotator-tui inbox` opens the local Plannotator Inbox, discovering its running server from
+`$PLANNOTATOR_DATA_DIR/inbox/inbox.json` or `~/.plannotator/inbox/inbox.json`; use `--url URL`
+to select a server explicitly. `--snapshot [COLS ROWS] [THREAD-ID]` prints a noninteractive
+view without sending POST requests. GET requests used to load the view may trigger server-side
+background image capture.
+
+```sh
+plannotator-tui inbox
+plannotator-tui inbox --snapshot 120 40
+```
+
+In the list, use `j`/`k` or arrow keys to move, `Enter` to open a thread or fold a section,
+and `q` to quit. In a thread, `Tab` moves between question cards, arrows select a choice,
+and `Enter` saves the pick. Use `o` for Other, `t` for a text answer, `N` for a note,
+`x` to clear a pick, `s` to send saved picks, or `r` to write and send a reply. `Esc`
+returns to the list. Picks are saved before Send; they do not reach the recipient until sent.
+
+Action items are shown read-only. The thread view shows message Markdown as sent, followed by
+the server's question cards; file annotation and other Inbox actions remain in Plannotator.
+
 ### Approval gate
 
 When a script or an agent must know whether you signed off, add `--gate`. The review gains

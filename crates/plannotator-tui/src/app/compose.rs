@@ -10,14 +10,14 @@ use unicode_width::UnicodeWidthChar;
 
 /// What a keystroke did to the compose box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ComposeAction {
+pub(crate) enum ComposeAction {
     Edited,
     Save,
     Cancel,
 }
 
 #[derive(Debug, Default)]
-pub(super) struct Compose {
+pub(crate) struct Compose {
     chars: Vec<char>,
     cursor: usize,
 }
@@ -27,17 +27,17 @@ fn width_of(c: char) -> usize {
 }
 
 impl Compose {
-    pub(super) fn with_text(text: &str) -> Self {
+    pub(crate) fn with_text(text: &str) -> Self {
         let chars: Vec<char> = text.chars().collect();
         let cursor = chars.len();
         Self { chars, cursor }
     }
 
-    pub(super) fn value(&self) -> String {
+    pub(crate) fn value(&self) -> String {
         self.chars.iter().collect()
     }
 
-    pub(super) fn handle_key(&mut self, key: KeyEvent) -> ComposeAction {
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> ComposeAction {
         match key.code {
             KeyCode::Esc => return ComposeAction::Cancel,
             KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
@@ -81,7 +81,7 @@ impl Compose {
     }
 
     /// Insert pasted text as typed characters, newlines included.
-    pub(super) fn insert_text(&mut self, text: &str) {
+    pub(crate) fn insert_text(&mut self, text: &str) {
         for c in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
             self.insert(c);
         }
@@ -115,7 +115,7 @@ impl Compose {
 
     /// The buffer wrapped to `width` display cells, with the cursor's (row, col) in that
     /// wrapping. Explicit newlines always break; a full row wraps to the next.
-    pub(super) fn wrapped(&self, width: usize) -> (Vec<String>, usize, usize) {
+    pub(crate) fn wrapped(&self, width: usize) -> (Vec<String>, usize, usize) {
         let width = width.max(1);
         let mut lines = vec![String::new()];
         let mut used = 0;

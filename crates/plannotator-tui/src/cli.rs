@@ -34,6 +34,7 @@ pub(crate) const USAGE: &str = "usage:
   plannotator-tui --annotate <file.md> <quote> <text> [comment|looks_good|delete] [--occurrence N]
   plannotator-tui --annotate-block <file.md> <block> <text>
   plannotator-tui --snapshot <file.md> [cols rows scroll] [select-quote] [menu]
+  plannotator-tui inbox [--url URL] [--snapshot [COLS ROWS]]
   plannotator-tui config
   plannotator-tui --version
   plannotator-tui herdr open [file.md | folder] [--placement overlay|split|popup] [--deliver-to <pane>]
@@ -149,7 +150,8 @@ fn wants_decision(args: &[String]) -> bool {
     match args.first() {
         Some(first) if decision_flag(first) => true,
         Some(first)
-            if first.starts_with('-') || matches!(first.as_str(), "config" | "herdr" | "rex" | "last") =>
+            if first.starts_with('-')
+                || matches!(first.as_str(), "config" | "herdr" | "rex" | "last" | "inbox") =>
         {
             false
         }
@@ -206,6 +208,7 @@ fn tool(args: &[String]) -> Result<()> {
         Some("herdr") => herdr_command(args.get(1..).unwrap_or_default()),
         Some("rex") => crate::rex::cli::run(args.get(1..).unwrap_or_default()),
         Some("last") => last_command(args.get(1..).unwrap_or_default()),
+        Some("inbox") => crate::inbox::run(args.get(1..).unwrap_or_default()),
         Some(flag) if flag.starts_with("--") => anyhow::bail!("unknown flag {flag}\n{USAGE}"),
         Some(_) => interactive(&path(0)?),
         None => anyhow::bail!(USAGE),

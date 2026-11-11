@@ -21,6 +21,9 @@ serde.workspace = true
 serde_json.workspace = true
 similar.workspace = true
 toml.workspace = true
+ureq = { version = "2.12", features = ["json"] }
+url = "2.5"
+unicode-segmentation = "1"
 unicode-width.workspace = true
 time = { version = "0.3", features = ["formatting", "parsing", "local-offset"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }

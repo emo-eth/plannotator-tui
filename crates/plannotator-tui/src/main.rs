@@ -14,6 +14,7 @@ mod gate;
 #[cfg(unix)]
 mod hangup;
 mod herdr;
+mod inbox;
 mod keys;
 mod last;
 mod layout;

@@ -3,7 +3,7 @@
 
 mod approve;
 mod archive_view;
-mod compose;
+pub(crate) mod compose;
 mod disk;
 mod draw;
 mod editor;
