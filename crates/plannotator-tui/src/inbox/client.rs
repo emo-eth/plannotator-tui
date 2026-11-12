@@ -1,6 +1,9 @@
+use std::cell::RefCell;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io::{BufRead, BufReader};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -12,15 +15,18 @@ use serde_json::{Value, json};
 use ureq::{Agent, AgentBuilder, Response};
 use url::Url;
 
+use super::actions::QuestionsResponse;
 use super::questions::Question;
 
 #[derive(Debug)]
 pub(crate) struct Client {
     url: String,
     server_session: String,
+    version: Option<String>,
+    last_cursor: Arc<AtomicU64>,
+    routes: RefCell<super::remote::Routes>,
     agent: Agent,
 }
-
 #[derive(Debug, Deserialize)]
 struct Registry {
     url: String,
@@ -32,6 +38,9 @@ struct Registry {
 struct Health {
     #[serde(rename = "serverSession")]
     server_session: String,
+    version: Option<String>,
+    #[serde(default)]
+    follows: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,6 +50,14 @@ pub(crate) struct List {
     pub(crate) cursor: u64,
     pub(crate) notice: Option<String>,
     pub(crate) sections: Vec<Section>,
+    #[serde(default)]
+    pub(crate) pins: Vec<Row>,
+    #[serde(default)]
+    pub(crate) snoozed: Vec<Row>,
+    #[serde(default)]
+    pub(crate) agents: Vec<Value>,
+    #[serde(rename = "self", default)]
+    pub(crate) self_machine: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -76,8 +93,12 @@ pub(crate) struct Row {
     pub(crate) unread: bool,
     pub(crate) answered_not_sent: bool,
     pub(crate) waiting_on_person: bool,
-    pub(crate) waiting_since: Option<String>,
     pub(crate) questions: QuestionSummary,
+    pub(crate) waiting_since: Option<String>,
+    pub(crate) machine: Option<String>,
+    pub(crate) addressee: Option<Addressee>,
+    pub(crate) participants: Vec<Participant>,
+    pub(crate) last_agent_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -99,10 +120,16 @@ pub(crate) struct Author {
     pub(crate) name: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct Participant {
+    pub(crate) session: String,
+}
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ThreadModel {
     #[serde(rename = "serverSession")]
     pub(crate) server_session: String,
+    pub(crate) cursor: u64,
     pub(crate) thread: Thread,
 }
 
@@ -128,6 +155,7 @@ pub(crate) struct Message {
     pub(crate) subject: Option<String>,
     pub(crate) body: String,
     pub(crate) created_at: String,
+    pub(crate) seq: Option<u64>,
     pub(crate) questions: Vec<Question>,
     pub(crate) to: Option<Addressee>,
     pub(crate) took_over: bool,
@@ -169,8 +197,8 @@ pub(crate) struct HttpError {
     pub(crate) status: u16,
     pub(crate) code: Option<String>,
     pub(crate) message: String,
+    pub(crate) payload: Value,
 }
-
 impl fmt::Display for HttpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.code {
@@ -187,6 +215,7 @@ pub(crate) enum Live {
     Connected { cursor: u64 },
     Record { seq: u64, kind: String, id: String, thread_id: Option<String> },
     Refresh,
+    Restarted { session: String, cursor: u64 },
     Lost(String),
 }
 
@@ -210,28 +239,53 @@ impl Client {
         Self::connect(url, None)
     }
 
-    pub(crate) fn url(&self) -> &str {
+    pub(super) fn url(&self) -> &str {
         &self.url
     }
 
+    pub(super) fn server_session(&self) -> &str {
+        &self.server_session
+    }
     pub(crate) fn list(&self) -> Result<List> {
-        let list: List = self.get_json("GET", "/api/inbox/threads")?;
+        let mut list: List =
+            self.get_json("GET", "/api/inbox/threads?machines=1&archived=exclude&snoozed=exclude")?;
         anyhow::ensure!(
             list.server_session == self.server_session,
             "GET {}: Inbox serverSession changed; rediscover before continuing",
             self.url
         );
+        self.last_cursor.fetch_max(list.cursor, Ordering::Relaxed);
+        if !list.snoozed.is_empty() {
+            list.sections.push(Section {
+                id: "snoozed".to_owned(),
+                label: "Snoozed".to_owned(),
+                threads: std::mem::take(&mut list.snoozed),
+            });
+        }
+        if !list.pins.is_empty() {
+            list.sections.insert(
+                0,
+                Section {
+                    id: "pinned".to_owned(),
+                    label: "Starred".to_owned(),
+                    threads: std::mem::take(&mut list.pins),
+                },
+            );
+        }
         Ok(list)
     }
 
     pub(crate) fn thread(&self, thread_id: &str) -> Result<ThreadModel> {
         let path = format!("/api/inbox/threads/{}", path_id(thread_id)?);
         let thread: ThreadModel = self.get_json("GET", &path)?;
-        anyhow::ensure!(
-            thread.server_session == self.server_session,
-            "GET {}: Inbox serverSession changed; rediscover before continuing",
-            endpoint(&self.url, &path)?
-        );
+        if self.machine_of(thread_id)?.is_none() {
+            anyhow::ensure!(
+                thread.server_session == self.server_session,
+                "GET {}: Inbox serverSession changed; rediscover before continuing",
+                endpoint(&self.url, &path)?
+            );
+            self.last_cursor.fetch_max(thread.cursor, Ordering::Relaxed);
+        }
         Ok(thread)
     }
 
@@ -251,40 +305,16 @@ impl Client {
         Ok(response.questions)
     }
 
-    pub(crate) fn reply(
-        &self,
-        message_id: &str,
-        idempotency_key: &str,
-        words: Option<&str>,
-        questions: &[Pick],
-        skip: &[Skip],
-    ) -> Result<Vec<Question>> {
-        let body = if let Some(words) = words {
-            json!({
-                "serverSession": self.server_session,
-                "idempotency_key": idempotency_key,
-                "questions": questions,
-                "skip": skip,
-                "words": words,
-            })
-        } else {
-            json!({
-                "serverSession": self.server_session,
-                "idempotency_key": idempotency_key,
-                "questions": questions,
-                "skip": skip,
-            })
-        };
-        let path = format!("/api/inbox/messages/{}/reply", path_id(message_id)?);
-        let response: QuestionsResponse = self.post_json(&path, &body)?;
-        Ok(response.questions)
-    }
-
     pub(crate) fn subscribe(&self, cursor: u64) -> Receiver<Live> {
         let (tx, rx) = mpsc::channel();
         let url = self.url.clone();
         let server_session = self.server_session.clone();
-        thread::spawn(move || event_worker(&url, &server_session, cursor, &tx));
+        let version = self.version.clone();
+        let latest_read = Arc::clone(&self.last_cursor);
+        latest_read.fetch_max(cursor, Ordering::Relaxed);
+        thread::spawn(move || {
+            event_worker(&url, &server_session, version.as_deref(), cursor, &latest_read, &tx);
+        });
         rx
     }
 
@@ -295,14 +325,11 @@ impl Client {
             "Inbox URL must use HTTP or HTTPS: {url}"
         );
         anyhow::ensure!(parsed.host_str().is_some(), "Inbox URL has no host: {url}");
-        anyhow::ensure!(
-            parsed.username().is_empty() && parsed.password().is_none(),
-            "Inbox URL must not contain credentials: {url}"
-        );
         let url = parsed.to_string();
         let agent = AgentBuilder::new()
             .timeout_connect(Duration::from_secs(3))
             .timeout_read(Duration::from_secs(20))
+            .redirects(0)
             .build();
         let health_url = endpoint(&url, "/api/inbox/health")?;
         let health: Health = get_with(&agent, &url, "GET", &health_url)?;
@@ -316,62 +343,218 @@ impl Client {
             !health.server_session.is_empty(),
             "GET {health_url}: Inbox health omitted serverSession"
         );
-        Ok(Self { url, server_session: health.server_session, agent })
+        Ok(Self {
+            url,
+            server_session: health.server_session,
+            version: health.version,
+            last_cursor: Arc::new(AtomicU64::new(0)),
+            routes: RefCell::new(super::remote::Routes::default()),
+            agent,
+        })
     }
 
-    fn get_json<T: DeserializeOwned>(&self, method: &str, path: &str) -> Result<T> {
-        let url = endpoint(&self.url, path)?;
-        get_with(&self.agent, &self.url, method, &url)
+    pub(super) fn adopt_session(&mut self, session: &str, cursor: u64) -> Result<()> {
+        anyhow::ensure!(!session.is_empty(), "Inbox restart hello omitted serverSession");
+        anyhow::ensure!(session != self.server_session, "Inbox restart session did not change");
+        anyhow::ensure!(
+            cursor >= self.last_cursor.load(Ordering::Relaxed),
+            "Inbox restart cursor is behind the latest read"
+        );
+        let health: Health = self.get_json("GET", "/api/inbox/health")?;
+        anyhow::ensure!(
+            health.server_session == session,
+            "Inbox restart health belongs to another server run"
+        );
+        anyhow::ensure!(
+            self.version.as_deref().is_some_and(|version| health.version.as_deref() == Some(version)),
+            "Inbox restart release changed; reload the Inbox"
+        );
+        anyhow::ensure!(
+            health.follows.iter().any(|previous| previous == &self.server_session),
+            "Inbox restart does not follow this server session; rediscover before continuing"
+        );
+        session.clone_into(&mut self.server_session);
+        self.last_cursor.fetch_max(cursor, Ordering::Relaxed);
+        Ok(())
     }
 
-    fn post_json<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
-        let url = endpoint(&self.url, path)?;
+    pub(crate) fn remember_displayed(&self, thread_id: &str, through_seq: u64) -> Result<()> {
+        self.routes.borrow_mut().displayed(thread_id, through_seq)
+    }
+
+    pub(super) fn get_json<T: DeserializeOwned>(&self, method: &str, path: &str) -> Result<T> {
+        let route = self.routes.borrow().resolve(path)?;
+        let url = endpoint(&self.url, route.path())?;
         let origin = origin_of(&self.url)?;
         let response = self
+            .agent
+            .get(&url)
+            .set("Accept", "application/json")
+            .set("Origin", &origin)
+            .set("Sec-Fetch-Site", "same-origin")
+            .call();
+        let (_status, response): (u16, Value) = match parse_response(response, method, &url) {
+            Ok(response) => response,
+            Err(error) => {
+                let retry = if let Some(http) = error.downcast_ref::<HttpError>().filter(|_| method == "GET")
+                {
+                    self.routes.borrow_mut().local_retry(&route, http.status, &http.payload)?
+                } else {
+                    None
+                };
+                if let Some(path) = retry {
+                    return self.get_json(method, &path);
+                }
+                return Err(error);
+            }
+        };
+        self.routes.borrow_mut().learn_response(&route, &response)?;
+        serde_json::from_value(response).with_context(|| format!("decoding {method} response from {url}"))
+    }
+
+    pub(super) fn get_bytes(&self, method: &str, path: &str) -> Result<Vec<u8>> {
+        let route = self.routes.borrow().resolve(path)?;
+        let url = endpoint(&self.url, route.path())?;
+        let origin = origin_of(&self.url)?;
+        let response =
+            self.agent.get(&url).set("Origin", &origin).set("Sec-Fetch-Site", "same-origin").call();
+        let response = match parse_raw_response(response, method, &url) {
+            Ok(response) => response,
+            Err(error) => {
+                let retry = if let Some(http) = error.downcast_ref::<HttpError>().filter(|_| method == "GET")
+                {
+                    self.routes.borrow_mut().local_retry(&route, http.status, &http.payload)?
+                } else {
+                    None
+                };
+                if let Some(path) = retry {
+                    return self.get_bytes(method, &path);
+                }
+                return Err(error);
+            }
+        };
+        let mut bytes = Vec::new();
+        let mut reader = response.into_reader();
+        std::io::Read::read_to_end(&mut reader, &mut bytes)
+            .with_context(|| format!("reading {method} response from {url}"))?;
+        Ok(bytes)
+    }
+
+    pub(super) fn get_text(&self, method: &str, path: &str) -> Result<String> {
+        String::from_utf8(self.get_bytes(method, path)?).context("Inbox response was not UTF-8")
+    }
+
+    pub(super) fn post_json<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
+        let route = self.routes.borrow().resolve_write(path, body)?;
+        let mut body = body.clone();
+        self.routes.borrow().prepare_write(&route, &mut body, &self.server_session, None)?;
+        let url = endpoint(&self.url, route.path())?;
+        let origin = origin_of(&self.url)?;
+        let mut request = self
             .agent
             .post(&url)
             .set("Content-Type", "application/json")
             .set("Accept", "application/json")
             .set("Origin", &origin)
-            .send_json(body);
-        parse_response(response, "POST", &url)
+            .set("Sec-Fetch-Site", "same-origin");
+        if let Some(thread) = self.routes.borrow().thread_context(&route) {
+            request = request.set("X-Plannotator-Thread", thread);
+        }
+        let response = request.send_json(&body);
+        let (status, value): (u16, Value) = parse_response(response, "POST", &url)?;
+        self.routes.borrow_mut().decode_write(&route, status, value)
+    }
+    pub(super) fn machine_of(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.routes.borrow().machine_of(id)?.map(str::to_owned))
+    }
+
+    pub(super) fn prepare_upload_path(&self, path: &str, key: Option<&str>) -> Result<String> {
+        let route = self.routes.borrow().resolve(path)?;
+        super::remote::Routes::prepare_file_write(&route, &self.server_session, key)
+    }
+
+    pub(super) fn post_bytes(&self, path: &str, content_type: &str, bytes: &[u8]) -> Result<Value> {
+        let routed_path = self.prepare_upload_path(path, None)?;
+        let route = self.routes.borrow().resolve(&routed_path)?;
+        let url = endpoint(&self.url, route.path())?;
+        let origin = origin_of(&self.url)?;
+        let mut request = self
+            .agent
+            .post(&url)
+            .set("Content-Type", content_type)
+            .set("Accept", "application/json")
+            .set("Origin", &origin)
+            .set("Sec-Fetch-Site", "same-origin");
+        if let Some(thread) = self.routes.borrow().thread_context(&route) {
+            request = request.set("X-Plannotator-Thread", thread);
+        }
+        let response = request.send_bytes(bytes);
+        let (status, value): (u16, Value) = parse_response(response, "POST", &url)?;
+        self.routes.borrow_mut().decode_write(&route, status, value)
     }
 }
-
-#[derive(Debug, Deserialize)]
-struct QuestionsResponse {
-    questions: Vec<Question>,
-}
-
-fn endpoint(base: &str, path: &str) -> Result<String> {
-    let base = Url::parse(base).context("parsing Inbox URL")?;
-    Ok(base.join(path)?.to_string())
-}
-
-fn origin_of(base: &str) -> Result<String> {
-    let base = Url::parse(base).context("parsing Inbox URL")?;
-    Ok(base.origin().ascii_serialization())
-}
-
-fn path_id(value: &str) -> Result<&str> {
+pub(super) fn path_id(value: &str) -> Result<&str> {
     anyhow::ensure!(
         !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
         "invalid Inbox id {value:?}"
     );
     Ok(value)
 }
+fn endpoint(base: &str, path: &str) -> Result<String> {
+    let base = Url::parse(base).context("parsing Inbox base URL")?;
+    let url = base.join(path).context("joining Inbox API path")?;
+    anyhow::ensure!(url.origin() == base.origin(), "Inbox API path must stay on the same origin");
+    Ok(url.into())
+}
+
+fn origin_of(url: &str) -> Result<String> {
+    let url = Url::parse(url).context("parsing Inbox origin")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+        "Inbox origin must use HTTP or HTTPS with a host"
+    );
+    Ok(url.origin().ascii_serialization())
+}
+
+fn parse_raw_response(
+    response: std::result::Result<Response, ureq::Error>,
+    method: &str,
+    url: &str,
+) -> Result<Response> {
+    match response {
+        Ok(response) => Ok(response),
+        Err(ureq::Error::Status(status, response)) => {
+            let body = response.into_string().unwrap_or_default();
+            let payload: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let code = payload.get("code").and_then(Value::as_str).map(str::to_owned);
+            let message = payload
+                .get("error")
+                .or_else(|| payload.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("request failed")
+                .to_owned();
+            Err(anyhow::Error::new(HttpError { status, code, message, payload }))
+                .with_context(|| format!("{method} {url}"))
+        }
+        Err(error) => Err(anyhow!(error)).with_context(|| format!("{method} {url}")),
+    }
+}
 
 fn get_with<T: DeserializeOwned>(agent: &Agent, base: &str, method: &str, url: &str) -> Result<T> {
     let origin = origin_of(base)?;
-    let response = agent.get(url).set("Accept", "application/json").set("Origin", &origin).call();
-    parse_response(response, method, url)
+    let response = agent
+        .get(url)
+        .set("Accept", "application/json")
+        .set("Origin", &origin)
+        .set("Sec-Fetch-Site", "same-origin")
+        .call();
+    parse_response(response, method, url).map(|(_, value)| value)
 }
-
 fn parse_response<T: DeserializeOwned>(
     response: std::result::Result<Response, ureq::Error>,
     method: &str,
     url: &str,
-) -> Result<T> {
+) -> Result<(u16, T)> {
     let response = match response {
         Ok(response) => response,
         Err(ureq::Error::Status(status, response)) => {
@@ -384,18 +567,28 @@ fn parse_response<T: DeserializeOwned>(
                 .and_then(Value::as_str)
                 .unwrap_or("request failed")
                 .to_owned();
-            return Err(anyhow::Error::new(HttpError { status, code, message }))
+            return Err(anyhow::Error::new(HttpError { status, code, message, payload }))
                 .with_context(|| format!("{method} {url}"));
         }
         Err(error) => return Err(anyhow!(error)).with_context(|| format!("{method} {url}")),
     };
-    response.into_json().with_context(|| format!("decoding {method} response from {url}"))
+    let status = response.status();
+    let value = response.into_json().with_context(|| format!("decoding {method} response from {url}"))?;
+    Ok((status, value))
 }
 
-fn event_worker(url: &str, server_session: &str, mut cursor: u64, tx: &Sender<Live>) {
+fn event_worker(
+    url: &str,
+    server_session: &str,
+    expected_version: Option<&str>,
+    mut cursor: u64,
+    latest_read: &AtomicU64,
+    tx: &Sender<Live>,
+) {
     let agent = AgentBuilder::new()
         .timeout_connect(Duration::from_secs(3))
         .timeout_read(Duration::from_secs(20))
+        .redirects(0)
         .build();
     let origin = match origin_of(url) {
         Ok(origin) => origin,
@@ -420,19 +613,26 @@ fn event_worker(url: &str, server_session: &str, mut cursor: u64, tx: &Sender<Li
             .set("Accept", "text/event-stream")
             .set("Cache-Control", "no-cache")
             .set("Origin", &origin)
+            .set("Sec-Fetch-Site", "same-origin")
             .set("Last-Event-ID", &cursor.to_string())
             .call();
         match response {
             Ok(response) => {
                 backoff = Duration::from_secs(1);
-                if let Err(error) =
-                    read_events(BufReader::new(response.into_reader()), server_session, &mut cursor, tx)
-                {
+                if let Err(error) = read_events(
+                    url,
+                    BufReader::new(response.into_reader()),
+                    server_session,
+                    expected_version,
+                    &mut cursor,
+                    latest_read,
+                    tx,
+                ) {
                     if tx.send(Live::Lost(error.to_string())).is_err() {
                         return;
                     }
-                    if error.to_string().contains("serverSession mismatch")
-                        || error.to_string().contains("event receiver was dropped")
+                    if error.to_string().contains("event receiver was dropped")
+                        || error.to_string().contains("serverSession changed")
                     {
                         return;
                     }
@@ -452,9 +652,12 @@ fn event_worker(url: &str, server_session: &str, mut cursor: u64, tx: &Sender<Li
 }
 
 fn read_events<R: BufRead>(
+    url: &str,
     mut reader: R,
     server_session: &str,
+    expected_version: Option<&str>,
     cursor: &mut u64,
+    latest_read: &AtomicU64,
     tx: &Sender<Live>,
 ) -> Result<()> {
     let mut line = String::new();
@@ -469,7 +672,10 @@ fn read_events<R: BufRead>(
         }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
-            if let Some(next) = dispatch_event(&event, &data, &event_id, server_session, cursor, tx)? {
+            let frame = EventFrame { kind: &event, data: &data, id: &event_id };
+            if let Some(next) =
+                dispatch_event(url, &frame, server_session, expected_version, cursor, latest_read, tx)?
+            {
                 return Err(anyhow!("Inbox {next}"));
             }
             event.clear();
@@ -502,26 +708,54 @@ fn read_events<R: BufRead>(
     }
 }
 
+struct EventFrame<'a> {
+    kind: &'a str,
+    data: &'a str,
+    id: &'a str,
+}
+
 fn dispatch_event(
-    event: &str,
-    data: &str,
-    event_id: &str,
+    url: &str,
+    event: &EventFrame<'_>,
     server_session: &str,
+    expected_version: Option<&str>,
     cursor: &mut u64,
+    latest_read: &AtomicU64,
     tx: &Sender<Live>,
 ) -> Result<Option<&'static str>> {
-    if data.is_empty() {
+    if event.data.is_empty() {
         return Ok(None);
     }
-    let value: Value = serde_json::from_str(data).context("parsing Inbox event JSON")?;
-    if event == "hello" {
+    let value: Value = serde_json::from_str(event.data).context("parsing Inbox event JSON")?;
+    if event.kind == "hello" {
         let Some(session) = value.get("serverSession").and_then(Value::as_str) else {
             return Ok(Some("hello omitted serverSession"));
         };
+        let Some(seen_cursor) = value.get("cursor").and_then(Value::as_u64) else {
+            return Ok(Some("hello omitted cursor"));
+        };
         if session != server_session {
-            return Ok(Some("serverSession mismatch; rediscover the Inbox"));
+            if seen_cursor < latest_read.load(Ordering::Relaxed) {
+                return Ok(Some("Inbox restart cursor is behind the latest read"));
+            }
+            let health_url = endpoint(url, "/api/inbox/health")?;
+            let agent = AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(3))
+                .timeout_read(Duration::from_secs(3))
+                .redirects(0)
+                .build();
+            let health: Health = get_with(&agent, url, "GET", &health_url)?;
+            if health.server_session != session
+                || expected_version.is_none_or(|version| health.version.as_deref() != Some(version))
+                || !health.follows.iter().any(|previous| previous == server_session)
+            {
+                return Ok(Some("Inbox restart health did not prove same release and lineage"));
+            }
+            if tx.send(Live::Restarted { session: session.to_owned(), cursor: seen_cursor }).is_err() {
+                return Ok(Some("event receiver was dropped"));
+            }
+            return Ok(Some("serverSession changed"));
         }
-        let seen_cursor = value.get("cursor").and_then(Value::as_u64).unwrap_or(*cursor);
         if tx.send(Live::Connected { cursor: seen_cursor }).is_err() {
             return Ok(Some("event receiver was dropped"));
         }
@@ -530,8 +764,8 @@ fn dispatch_event(
         }
         return Ok(None);
     }
-    if event == "record" {
-        let seq = event_id.parse::<u64>().ok().or_else(|| value.get("seq").and_then(Value::as_u64));
+    if event.kind == "record" {
+        let seq = event.id.parse::<u64>().ok().or_else(|| value.get("seq").and_then(Value::as_u64));
         let Some(seq) = seq else { return Ok(None) };
         let kind = value.get("kind").and_then(Value::as_str).unwrap_or_default().to_owned();
         let id = value.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
@@ -547,8 +781,17 @@ fn dispatch_event(
         return Ok(None);
     }
     if matches!(
-        event,
-        "rows" | "pins" | "snoozes" | "machines" | "drafts" | "deliveries" | "reach" | "status" | "updated"
+        event.kind,
+        "rows"
+            | "pins"
+            | "snoozes"
+            | "machines"
+            | "drafts"
+            | "deliveries"
+            | "reach"
+            | "status"
+            | "updated"
+            | "thread-pulls"
     ) && tx.send(Live::Refresh).is_err()
     {
         return Ok(Some("event receiver was dropped"));
@@ -598,8 +841,16 @@ mod tests {
     fn recorded_sse_uses_live_parser_and_reconnect_frame_contract() {
         let (tx, rx) = mpsc::channel();
         let mut cursor = 0;
-        read_events(Cursor::new(include_str!("fixtures/events.txt")), "fixture-session", &mut cursor, &tx)
-            .expect("parse SSE");
+        read_events(
+            "http://127.0.0.1",
+            Cursor::new(include_str!("fixtures/events.txt")),
+            "fixture-session",
+            None,
+            &mut cursor,
+            &AtomicU64::new(0),
+            &tx,
+        )
+        .expect("parse SSE");
         assert_eq!(cursor, 3);
         assert_eq!(rx.recv().expect("connected"), Live::Connected { cursor: 3 });
         assert_eq!(rx.recv().expect("refresh"), Live::Refresh);
@@ -616,18 +867,43 @@ mod tests {
 
     #[test]
     fn stale_session_hello_stops_replay() {
-        let (tx, _rx) = mpsc::channel();
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("health fixture");
+        let url = format!("http://{}", listener.local_addr().expect("health address"));
+        let health = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("health request");
+            let mut reader = BufReader::new(&mut stream);
+            let mut header = String::new();
+            loop {
+                header.clear();
+                assert!(
+                    reader.read_line(&mut header).expect("read health request") > 0,
+                    "request ended before its headers"
+                );
+                if header == "\r\n" {
+                    break;
+                }
+            }
+            let body = r#"{"serverSession":"other","version":"fixture-version","follows":[]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("write health response");
+        });
+        let (tx, rx) = mpsc::channel();
         let mut cursor = 9;
         let error = dispatch_event(
-            "hello",
-            r#"{"serverSession":"other","cursor":15}"#,
-            "",
+            &url,
+            &EventFrame { kind: "hello", data: r#"{"serverSession":"other","cursor":15}"#, id: "" },
             "fixture-session",
+            Some("fixture-version"),
             &mut cursor,
+            &AtomicU64::new(9),
             &tx,
         )
         .expect("well-formed hello");
-        assert_eq!(error, Some("serverSession mismatch; rediscover the Inbox"));
+        health.join().expect("health fixture completed");
+        assert_eq!(error, Some("Inbox restart health did not prove same release and lineage"));
         assert_eq!(cursor, 9);
+        assert!(rx.try_recv().is_err());
     }
 }

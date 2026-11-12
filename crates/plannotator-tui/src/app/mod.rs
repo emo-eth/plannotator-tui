@@ -454,6 +454,19 @@ impl App {
         self.status = Some(status);
     }
 
+    /// The active document's typed annotations, for an embedded Inbox review to save.
+    pub(crate) fn annotations(&self) -> Vec<plannotator_tui_schema::Annotation> {
+        self.open.store.annotations().to_vec()
+    }
+
+    /// Import server annotations into an embedded review; unresolved anchors remain intact.
+    pub(crate) fn replace_annotations(
+        &mut self,
+        annotations: Vec<plannotator_tui_schema::Annotation>,
+    ) -> Result<()> {
+        self.open.store.replace_annotations(&self.open.doc, annotations)
+    }
+
     /// Mark this as a terminal review whose wrapper broke tokens at `breaks` (sorted).
     pub(crate) fn set_terminal_breaks(&mut self, breaks: Vec<usize>) {
         self.terminal_breaks = Some(breaks);

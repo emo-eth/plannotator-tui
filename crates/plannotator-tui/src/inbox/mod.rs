@@ -9,14 +9,42 @@
 //! read may capture images of the thread's pages in the background; that is the server's
 //! doing on every read, the window's included, and writes nothing to the thread.)
 
+mod actions;
+mod agents;
+mod annotation_routes;
+mod artifacts;
+mod ask;
+mod attachments;
+mod board;
 mod card;
 mod client;
+mod decisions;
+mod delivery;
+mod drafts;
 mod draw;
+mod features;
 mod format;
+mod guide_forge;
+mod history;
+mod launch;
+mod machines;
+mod main_delta;
+mod media;
+mod navigation;
+mod projects;
+mod pulls;
 mod questions;
+mod remote;
+mod reviews;
+mod search;
 mod send;
+mod settings;
+mod settings_extra;
+mod shapes;
+mod sharing;
 mod thread;
 mod ui;
+mod update;
 
 use std::io::{IsTerminal as _, stdout};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -29,7 +57,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 
-use self::client::{Client, HttpError, Live, Pick};
+use self::client::{Client, Live, Pick};
 use self::ui::{Inbox, Request};
 
 pub(crate) const USAGE: &str = "usage:
@@ -104,7 +132,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         }
         Parsed::Args(args) => args,
     };
-    let client = match args.url {
+    let mut client = match args.url {
         Some(url) => Client::from_url(&url)?,
         None => Client::discover()?.context(
             "the Plannotator Inbox is not running: start it with `plannotator inbox --background`, or pass --url",
@@ -112,7 +140,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     };
     match args.snapshot {
         Some(snapshot) => draw_snapshot(&client, &snapshot),
-        None => interactive(&client),
+        None => interactive(&mut client),
     }
 }
 
@@ -178,7 +206,7 @@ impl Drop for Screen {
     }
 }
 
-fn interactive(client: &Client) -> Result<()> {
+fn interactive(client: &mut Client) -> Result<()> {
     anyhow::ensure!(stdout().is_terminal(), "the Inbox needs a terminal; use --snapshot to print one frame");
     let config = crate::config::Config::load().unwrap_or_default();
     crate::theme::install(
@@ -191,34 +219,85 @@ fn interactive(client: &Client) -> Result<()> {
     event_loop(&mut screen.terminal, client, &mut inbox)
 }
 
-fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: &Client, inbox: &mut Inbox) -> Result<()> {
+fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: &mut Client, inbox: &mut Inbox) -> Result<()> {
     perform(inbox, client, Request::List);
     let mut live: Option<Receiver<Live>> = None;
     // The stream is opened once the list has been read, and opened again, after a pause,
     // should its thread ever end; the list itself is asked for again until it is read.
     let mut retry_at = Instant::now();
     let mut dirty = true;
+    let mut draft_changed: Option<Instant> = None;
     while !inbox.quit {
         if dirty {
             terminal.draw(|frame| inbox.draw(frame))?;
+            if inbox.mode != ui::Mode::List
+                && let Some(thread) = &inbox.thread
+                && let Some(seq) = thread.displayed_through(inbox.body_height)
+                && let Err(error) = client.remember_displayed(thread.id(), seq)
+            {
+                inbox.status = Some(format!("displayed thread watermark: {error:#}"));
+            }
             dirty = false;
         }
         if event::poll(Duration::from_millis(250))? {
-            let mut requests = handle(inbox, &event::read()?);
-            // Coalesce a burst (a paste, a held key) into one redraw.
-            while event::poll(Duration::ZERO)? {
-                requests.extend(handle(inbox, &event::read()?));
+            let composing = matches!(inbox.mode, ui::Mode::Compose(ui::ComposeFor::Reply));
+            if let Err(error) = inbox.sync_reply_draft() {
+                inbox.failed(&format!("{error:#}"));
             }
-            for request in dedup(requests) {
-                perform(inbox, client, request);
+            let requests = handle(inbox, &event::read()?);
+            match inbox.sync_reply_draft() {
+                Ok(true) => draft_changed = Some(Instant::now()),
+                Ok(false) => {}
+                Err(error) => inbox.failed(&format!("{error:#}")),
             }
+            if composing
+                && (inbox.quit || !matches!(inbox.mode, ui::Mode::Compose(ui::ComposeFor::Reply)))
+                && requests.is_empty()
+                && let Err(error) = inbox.save_reply_draft(client)
+            {
+                inbox.quit = false;
+                inbox.mode = ui::Mode::Compose(ui::ComposeFor::Reply);
+                inbox.failed(&format!("{error:#}"));
+            }
+            // Execute each event before reading the next. A queued feature key cannot
+            // overtake a Send and mutate its frozen payload, and a panel owns its input.
+            perform_input_requests(terminal, client, inbox, requests);
             dirty = true;
         }
         if let Some(receiver) = &live {
             let mut requests = Vec::new();
             loop {
                 match receiver.try_recv() {
+                    Ok(Live::Restarted { session, cursor }) => {
+                        inbox.restarting();
+                        live = None;
+                        let catch_up = client.adopt_session(&session, cursor).and_then(|()| {
+                            let list = client.list()?;
+                            let thread =
+                                inbox.thread.as_ref().map(|thread| client.thread(thread.id())).transpose()?;
+                            inbox.loaded_list(list);
+                            if let Some(thread) = thread {
+                                inbox.opened_thread(thread);
+                            }
+                            refresh_reply_draft(inbox, client)
+                        });
+                        match catch_up {
+                            Ok(()) => {
+                                inbox.writes_ready = true;
+                                inbox.status = Some("Inbox restart verified; state refreshed".to_owned());
+                            }
+                            Err(error) => inbox.failed(&format!("restart not adopted safely: {error:#}")),
+                        }
+                        retry_at = Instant::now();
+                        dirty = true;
+                        break;
+                    }
                     Ok(event) => {
+                        let draft_event = matches!(&event, Live::Record { kind, .. } if kind.contains("draft"))
+                            || matches!(&event, Live::Refresh | Live::Connected { .. });
+                        if draft_event && let Err(error) = refresh_reply_draft(inbox, client) {
+                            inbox.status = Some(format!("draft refresh failed: {error:#}"));
+                        }
                         requests.extend(inbox.live(event));
                         dirty = true;
                     }
@@ -237,6 +316,13 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: &Client, inbox: &
                 perform(inbox, client, request);
             }
         }
+        if draft_changed.is_some_and(|at| at.elapsed() >= drafts::SAVE_DELAY) {
+            if let Err(error) = inbox.save_reply_draft(client) {
+                inbox.failed(&format!("{error:#}"));
+            }
+            draft_changed = None;
+            dirty = true;
+        }
         if Instant::now() >= retry_at {
             match inbox.list.as_ref().map(|l| l.cursor) {
                 Some(cursor) if live.is_none() => live = Some(client.subscribe(cursor)),
@@ -247,6 +333,41 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: &Client, inbox: &
                 }
             }
             retry_at = Instant::now() + RETRY;
+        }
+    }
+    Ok(())
+}
+
+fn perform_input_requests(
+    terminal: &mut ratatui::DefaultTerminal,
+    client: &mut Client,
+    inbox: &mut Inbox,
+    requests: Vec<Request>,
+) {
+    for request in dedup(requests) {
+        if !inbox.writes_ready && !matches!(request, Request::List | Request::Thread(_)) {
+            inbox.failed("writes paused until the restarted Inbox has been read successfully");
+            continue;
+        }
+        if let Request::Feature(feature) = request {
+            if let Err(error) = features::run(feature, client, terminal, inbox) {
+                inbox.failed(&format!("{error:#}"));
+            }
+            reread_thread(inbox, client);
+            perform(inbox, client, Request::List);
+        } else {
+            perform(inbox, client, request);
+        }
+    }
+}
+
+fn refresh_reply_draft(inbox: &mut Inbox, client: &Client) -> Result<()> {
+    if !inbox.has_unconfirmed()
+        && let Some(draft) = inbox.draft.as_mut()
+    {
+        draft.refresh(client)?;
+        if matches!(inbox.mode, ui::Mode::Compose(ui::ComposeFor::Reply)) {
+            inbox.compose = crate::app::compose::Compose::with_text(draft.body());
         }
     }
     Ok(())
@@ -270,7 +391,7 @@ fn dedup(requests: Vec<Request>) -> Vec<Request> {
         let seen = match &request {
             Request::List => out.iter().any(|o| matches!(o, Request::List)),
             Request::Thread(id) => out.iter().any(|o| matches!(o, Request::Thread(other) if other == id)),
-            Request::Pick { .. } | Request::Send(_) => false,
+            Request::Pick { .. } | Request::Send(_) | Request::Feature(_) | Request::ComposeReply => false,
         };
         if !seen {
             out.push(request);
@@ -285,7 +406,33 @@ fn dedup(requests: Vec<Request>) -> Vec<Request> {
 /// (4xx) was not written; one it never answered for may have been, and stays to be sent
 /// again as it was.
 fn perform(inbox: &mut Inbox, client: &Client, request: Request) {
+    if !inbox.writes_ready && matches!(request, Request::Pick { .. } | Request::Send(_)) {
+        inbox.failed("writes paused while verifying Inbox restart");
+        return;
+    }
     match request {
+        Request::Feature(_) => inbox.failed("feature panels require an interactive terminal"),
+        Request::ComposeReply => {
+            let Some(id) = inbox.context_thread_id() else { return };
+            if let Some(draft) = inbox.draft.as_ref() {
+                let words = draft.body().to_owned();
+                inbox.compose_reply(&words);
+                return;
+            }
+            match drafts::DraftState::load(client, &id) {
+                Ok(mut draft) => {
+                    if let Some(thread) = &inbox.thread
+                        && let Err(error) = draft.pin_recipient(&thread.model.thread)
+                    {
+                        inbox.failed(&format!("{error:#}"));
+                        return;
+                    }
+                    inbox.compose_reply(draft.body());
+                    inbox.draft = Some(draft);
+                }
+                Err(error) => inbox.failed(&format!("reading reply draft: {error:#}")),
+            }
+        }
         Request::List => match client.list() {
             Ok(list) => inbox.loaded_list(list),
             Err(error) => inbox.failed(&format!("{error:#}")),
@@ -304,29 +451,7 @@ fn perform(inbox: &mut Inbox, client: &Client, request: Request) {
                 }
             }
         }
-        Request::Send(targets) => {
-            for (index, target) in targets.iter().enumerate() {
-                let sent = client.reply(
-                    &target.message_id,
-                    &target.idempotency_key,
-                    target.words.as_deref(),
-                    &target.questions,
-                    &[],
-                );
-                if let Err(error) = sent {
-                    let refused =
-                        error.downcast_ref::<HttpError>().is_some_and(|e| (400..500).contains(&e.status));
-                    let remaining = targets.get(index..).unwrap_or_default().to_vec();
-                    inbox.send_failed(index, remaining, &format!("{error:#}"), refused);
-                    reread_thread(inbox, client);
-                    perform(inbox, client, Request::List);
-                    return;
-                }
-            }
-            inbox.sent(targets.len());
-            reread_thread(inbox, client);
-            perform(inbox, client, Request::List);
-        }
+        Request::Send(targets) => delivery::send(inbox, client, targets),
     }
 }
 

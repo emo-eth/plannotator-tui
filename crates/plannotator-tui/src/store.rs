@@ -288,6 +288,17 @@ impl Store {
             .collect();
     }
 
+    /// Replace an embedded document's active annotations without discarding opaque anchors.
+    pub(crate) fn replace_annotations(&mut self, doc: &Document, annotations: Vec<Annotation>) -> Result<()> {
+        self.annotations = annotations;
+        self.resolve_all(doc);
+        self.save()
+    }
+
+    pub(crate) fn annotations(&self) -> &[Annotation] {
+        &self.annotations
+    }
+
     /// Every resolved annotation, in source order.
     pub(crate) fn placed(&self) -> Vec<Placed<'_>> {
         let mut out: Vec<Placed<'_>> = self

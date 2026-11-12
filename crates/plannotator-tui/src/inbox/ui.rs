@@ -2,13 +2,16 @@
 //! answer cards, and the compose box for replies and written answers. Pure over the data
 //! it is given: every read or write of the server is a [`Request`] the caller performs, so
 //! a snapshot draws the same state without ever sending anything.
+//! Help and feature selection share one overlay; retry, discard and restart state belongs
+//! to the pending Send and is cleared when that Send is confirmed or discarded.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
 use super::client::{List, Live, ThreadModel};
+use super::features::{self, Feature};
 use super::questions::{Answer, Kind, Question, State};
 use super::send::{self, Target};
 use super::thread::ThreadView;
@@ -25,6 +28,8 @@ const UNCONFIRMED: &str = "an earlier send is unconfirmed: s retries it as it wa
 pub(crate) enum Request {
     List,
     Thread(String),
+    Feature(Feature),
+    ComposeReply,
     /// Save one pick: `answer` is the answer's JSON, or `Value::Null` to clear it.
     Pick {
         message_id: String,
@@ -69,6 +74,13 @@ pub(crate) enum LiveState {
     Lost(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Overlay {
+    Closed,
+    Features(usize),
+    Help,
+}
+
 pub(crate) struct Inbox {
     pub(crate) url: String,
     pub(crate) list: Option<List>,
@@ -91,8 +103,12 @@ pub(crate) struct Inbox {
     submitted: Option<(ComposeFor, String)>,
     /// A Send the server has not confirmed, replayed as it was until it is.
     pending_send: Option<Unconfirmed>,
-    /// `D` was just pressed on an unconfirmed Send: the next `D` discards it.
-    discard_armed: bool,
+    pub(crate) overlay: Overlay,
+    pub(crate) project_filter: Option<String>,
+    pub(crate) agent_filter: Option<super::agents::AgentListFilter>,
+    pub(crate) draft: Option<super::drafts::DraftState>,
+    remote_drafts: HashMap<String, super::drafts::DraftState>,
+    pub(crate) writes_ready: bool,
 }
 
 /// The replies of a Send not yet confirmed, keys included, and the thread they answer. After
@@ -105,6 +121,8 @@ struct Unconfirmed {
     thread_id: String,
     targets: Vec<Target>,
     retried: bool,
+    discard_armed: bool,
+    restarted: bool,
 }
 
 /// A cursor stop named so it can be found again in a new list.
@@ -134,7 +152,12 @@ impl Inbox {
             body_width: 80,
             submitted: None,
             pending_send: None,
-            discard_armed: false,
+            overlay: Overlay::Closed,
+            project_filter: None,
+            agent_filter: None,
+            draft: None,
+            remote_drafts: HashMap::new(),
+            writes_ready: true,
         }
     }
 
@@ -150,6 +173,8 @@ impl Inbox {
         if let Some(thread) = self.thread.as_mut().filter(|t| t.id() == model.thread.thread_id) {
             thread.replace(model);
         } else {
+            self.keep_remote_draft();
+            self.draft = self.remote_drafts.remove(&model.thread.thread_id);
             self.thread = Some(ThreadView::new(model, self.body_width));
             self.mode = Mode::Thread;
         }
@@ -202,12 +227,57 @@ impl Inbox {
                 requests
             }
             Live::Refresh => vec![Request::List],
+            Live::Restarted { .. } => {
+                self.restarting();
+                Vec::new()
+            }
             Live::Lost(reason) => {
                 self.status = Some(format!("live updates lost: {reason}"));
                 self.live = LiveState::Lost(reason);
                 Vec::new()
             }
         }
+    }
+
+    pub(crate) fn restarting(&mut self) {
+        self.writes_ready = false;
+        if let Some(pending) = self.pending_send.as_mut() {
+            pending.restarted = true;
+        }
+        self.live = LiveState::Connecting;
+        self.status = Some("verifying Inbox restart; writes paused".to_owned());
+    }
+
+    pub(crate) fn has_unconfirmed(&self) -> bool {
+        self.pending_send.is_some()
+    }
+
+    /// Keep the server draft in step with the reply editor without writing on every key.
+    pub(crate) fn sync_reply_draft(&mut self) -> anyhow::Result<bool> {
+        if self.has_unconfirmed() || self.mode != Mode::Compose(ComposeFor::Reply) {
+            return Ok(false);
+        }
+        let text = self.compose.value();
+        if let Some(draft) = self.draft.as_mut()
+            && draft.body() != text
+        {
+            draft.set_body(text)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn save_reply_draft(&mut self, client: &super::client::Client) -> anyhow::Result<()> {
+        if self.has_unconfirmed() || !self.writes_ready {
+            return Ok(());
+        }
+        if let Some(draft) = self.draft.as_mut()
+            && draft.is_dirty()
+            && draft.save(client)? == super::drafts::SaveOutcome::Conflict
+        {
+            anyhow::bail!("reply draft changed in another window; F2 → Reply draft resolves the conflict");
+        }
+        Ok(())
     }
 
     // ── The list ──────────────────────────────────────────────────────────────────
@@ -225,12 +295,19 @@ impl Inbox {
         let mut entries = Vec::new();
         if let Some(list) = &self.list {
             for (s, section) in list.sections.iter().enumerate() {
-                if section.threads.is_empty() {
+                if !section.threads.iter().any(|row| self.matches_project(row)) {
                     continue;
                 }
                 entries.push(Entry::Header(s));
                 if !self.collapsed.contains(&section.id) {
-                    entries.extend((0..section.threads.len()).map(|r| Entry::Row(s, r)));
+                    entries.extend(
+                        section
+                            .threads
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, row)| self.matches_project(row))
+                            .map(|(r, _)| Entry::Row(s, r)),
+                    );
                 }
             }
         }
@@ -254,6 +331,65 @@ impl Inbox {
             }
             Entry::Header(_) => None,
         }
+    }
+
+    pub(crate) fn context_thread_id(&self) -> Option<String> {
+        self.thread
+            .as_ref()
+            .map(|t| t.id().to_owned())
+            .or_else(|| self.entries.get(self.cursor).and_then(|entry| self.row_id(*entry)))
+    }
+
+    fn matches_project(&self, row: &super::client::Row) -> bool {
+        self.project_filter.as_ref().is_none_or(|id| row.project.id == *id)
+            && self.agent_filter.as_ref().is_none_or(|filter| {
+                super::agents::agent_row_matches(
+                    row,
+                    filter,
+                    self.list.as_ref().and_then(|list| list.self_machine.as_deref()),
+                )
+            })
+    }
+
+    pub(crate) fn set_project_filter(&mut self, project: Option<String>) {
+        self.project_filter = project;
+        self.keep_remote_draft();
+        self.thread = None;
+        self.draft = None;
+        self.mode = Mode::List;
+        self.cursor = 0;
+        self.list_scroll = 0;
+        self.rebuild_entries(None);
+    }
+
+    pub(crate) fn set_agent_filter(&mut self, filter: Option<super::agents::AgentListFilter>) {
+        self.agent_filter = filter;
+        self.keep_remote_draft();
+        self.thread = None;
+        self.draft = None;
+        self.mode = Mode::List;
+        self.cursor = 0;
+        self.list_scroll = 0;
+        self.rebuild_entries(None);
+    }
+
+    pub(crate) fn compose_reply(&mut self, text: &str) {
+        self.compose = Compose::with_text(text);
+        self.mode = Mode::Compose(ComposeFor::Reply);
+    }
+
+    pub(crate) fn replace_pending(&mut self, targets: Vec<Target>) {
+        if let Some(pending) = self.pending_send.as_mut() {
+            pending.targets = targets;
+        }
+    }
+
+    pub(crate) fn cancel_preparation(&mut self, message: &str) {
+        self.pending_send = None;
+        if let Some(draft) = self.draft.as_mut() {
+            draft.release_send();
+        }
+        self.failed(message);
     }
 
     pub(crate) fn is_collapsed(&self, section_id: &str) -> bool {
@@ -329,12 +465,19 @@ impl Inbox {
     }
 
     // ── The thread ────────────────────────────────────────────────────────────────
+    fn keep_remote_draft(&mut self) {
+        if let Some(draft) = self.draft.take().filter(super::drafts::DraftState::is_remote) {
+            self.remote_drafts.insert(draft.thread_id.clone(), draft);
+        }
+    }
 
     fn close_thread(&mut self) {
         if self.blocked_by_unconfirmed() {
             return;
         }
+        self.keep_remote_draft();
         self.thread = None;
+        self.draft = None;
         self.mode = Mode::List;
     }
 
@@ -360,14 +503,17 @@ impl Inbox {
             self.status = Some("no unconfirmed send".to_owned());
             return;
         }
-        if self.discard_armed {
+        if self.pending_send.as_ref().is_some_and(|pending| pending.discard_armed) {
             self.pending_send = None;
+            if let Some(draft) = self.draft.as_mut() {
+                draft.release_send();
+            }
             self.status = Some(
                 "unconfirmed send discarded: what it wrote, if anything, is in the thread; sending it again would write it twice"
                     .to_owned(),
             );
-        } else {
-            self.discard_armed = true;
+        } else if let Some(pending) = self.pending_send.as_mut() {
+            pending.discard_armed = true;
             self.status = Some(
                 "that send may already have been delivered; D again discards it anyway (s retries it as it was)"
                     .to_owned(),
@@ -414,8 +560,11 @@ impl Inbox {
             KeyCode::Char('x') if focused => return self.clear_pick(),
             KeyCode::Enter | KeyCode::Char('r') => {
                 let seed = self.unconfirmed().and_then(|p| p.iter().find_map(|t| t.words.clone()));
-                self.compose = Compose::with_text(seed.as_deref().unwrap_or(""));
-                self.mode = Mode::Compose(ComposeFor::Reply);
+                if let Some(seed) = seed {
+                    self.compose_reply(&seed);
+                } else {
+                    return vec![Request::ComposeReply];
+                }
             }
             KeyCode::Char('s') => return self.send(""),
             KeyCode::Char('R') => return vec![Request::Thread(thread.id().to_owned())],
@@ -540,6 +689,10 @@ impl Inbox {
     /// While an earlier Send is unconfirmed, `s` or the same words send it again exactly as
     /// it was, keys included; other words wait until it is confirmed or discarded.
     fn send(&mut self, words: &str) -> Vec<Request> {
+        if self.pending_send.as_ref().is_some_and(|pending| pending.restarted) {
+            self.status = Some("Inbox restarted after an unconfirmed send; inspect the thread, then D twice discards it. Automatic replay across restart is disabled.".to_owned());
+            return Vec::new();
+        }
         let Some(thread) = self.thread.as_ref() else { return Vec::new() };
         if let Some(pending) = self.pending_send.as_mut().filter(|p| p.thread_id == thread.id()) {
             if !words.is_empty() && !pending.targets.iter().any(|t| t.words.as_deref() == Some(words)) {
@@ -550,16 +703,13 @@ impl Inbox {
             return vec![Request::Send(pending.targets.clone())];
         }
         let targets = send::targets(&thread.model.thread, words);
-        if targets.is_empty() {
-            self.status = Some(if thread.has_picks() {
-                "nothing to send".to_owned()
-            } else {
-                "nothing to send: pick an answer or write a reply (r)".to_owned()
-            });
-            return Vec::new();
-        }
-        self.pending_send =
-            Some(Unconfirmed { thread_id: thread.id().to_owned(), targets: targets.clone(), retried: false });
+        self.pending_send = Some(Unconfirmed {
+            thread_id: thread.id().to_owned(),
+            targets: targets.clone(),
+            retried: false,
+            discard_armed: false,
+            restarted: false,
+        });
         vec![Request::Send(targets)]
     }
 
@@ -571,6 +721,9 @@ impl Inbox {
     pub(crate) fn send_failed(&mut self, went: usize, remaining: Vec<Target>, error: &str, refused: bool) {
         let words_unsent = remaining.iter().any(|t| t.words.is_some());
         if refused && self.pending_send.as_ref().is_none_or(|p| !p.retried) {
+            if let Some(draft) = self.draft.as_mut() {
+                draft.release_send();
+            }
             self.pending_send = None;
             if words_unsent {
                 self.failed(error);
@@ -598,6 +751,16 @@ impl Inbox {
     // ── The compose box ───────────────────────────────────────────────────────────
 
     fn compose_key(&mut self, purpose: ComposeFor, key: KeyEvent) -> Vec<Request> {
+        if key.code == KeyCode::F(2) && purpose == ComposeFor::Reply {
+            if !self.blocked_by_unconfirmed() {
+                if let Err(error) = self.sync_reply_draft() {
+                    self.failed(&format!("{error:#}"));
+                    return Vec::new();
+                }
+                return vec![Request::Feature(Feature::Drafts)];
+            }
+            return Vec::new();
+        }
         match self.compose.handle_key(key) {
             ComposeAction::Edited => Vec::new(),
             ComposeAction::Cancel => {
@@ -615,11 +778,37 @@ impl Inbox {
     fn submit(&mut self, purpose: ComposeFor, text: String) -> Vec<Request> {
         let requests = match &purpose {
             ComposeFor::Reply => {
-                if text.trim().is_empty() {
+                if text.trim().is_empty() && self.draft.as_ref().is_none_or(|draft| draft.files().is_empty())
+                {
                     self.status = Some("the reply is empty".to_owned());
                     return Vec::new();
                 }
-                let requests = self.send(&text);
+                let retry = self.has_unconfirmed();
+                let mut requests = self.send(&text);
+                if text.trim().is_empty() && !retry && !requests.is_empty() {
+                    let message_id = self
+                        .thread
+                        .as_ref()
+                        .and_then(|thread| send::words_message(&thread.model.thread))
+                        .map(|message| message.id.clone());
+                    if let (Some(Request::Send(targets)), Some(message_id)) =
+                        (requests.first_mut(), message_id)
+                    {
+                        if let Some(target) =
+                            targets.iter_mut().find(|target| target.message_id == message_id)
+                        {
+                            target.words = Some(String::new());
+                        } else {
+                            targets.push(Target {
+                                message_id,
+                                words: Some(String::new()),
+                                idempotency_key: send::new_key(),
+                                ..Target::default()
+                            });
+                        }
+                        self.replace_pending(targets.clone());
+                    }
+                }
                 if requests.is_empty() && self.unconfirmed().is_some() {
                     self.compose = Compose::with_text(&text);
                     self.mode = Mode::Compose(ComposeFor::Reply);
@@ -680,8 +869,63 @@ impl Inbox {
             self.quit = true;
             return Vec::new();
         }
+        if self.overlay == Overlay::Help {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | '?') | KeyCode::F(1)) {
+                self.overlay = Overlay::Closed;
+            }
+            return Vec::new();
+        }
+        if let Overlay::Features(cursor) = self.overlay {
+            let last = features::ALL.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(2) => self.overlay = Overlay::Closed,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.overlay = Overlay::Features((cursor + 1).min(last));
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.overlay = Overlay::Features(cursor.saturating_sub(1));
+                }
+                KeyCode::Home => self.overlay = Overlay::Features(0),
+                KeyCode::End => self.overlay = Overlay::Features(last),
+                KeyCode::Enter => {
+                    if let Some(feature) = features::ALL.get(cursor).copied() {
+                        self.overlay = Overlay::Closed;
+                        if feature.needs_thread() && self.context_thread_id().is_none() {
+                            self.status = Some("select or open a thread first".to_owned());
+                        } else {
+                            return vec![Request::Feature(feature)];
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Vec::new();
+        }
+        if !matches!(self.mode, Mode::Compose(_)) {
+            if matches!(key.code, KeyCode::Char('?') | KeyCode::F(1)) {
+                self.overlay = Overlay::Help;
+                return Vec::new();
+            }
+            let feature = match key.code {
+                KeyCode::Char('/') => Some(Feature::Search),
+                KeyCode::Char('L') => Some(Feature::Launch),
+                _ => None,
+            };
+            if key.code == KeyCode::F(2) || feature.is_some() {
+                if self.blocked_by_unconfirmed() {
+                    return Vec::new();
+                }
+                if let Some(feature) = feature {
+                    return vec![Request::Feature(feature)];
+                }
+                self.overlay = Overlay::Features(0);
+                return Vec::new();
+            }
+        }
         self.status = None;
-        self.discard_armed = self.discard_armed && key.code == KeyCode::Char('D');
+        if let Some(pending) = self.pending_send.as_mut() {
+            pending.discard_armed &= key.code == KeyCode::Char('D');
+        }
         match self.mode.clone() {
             Mode::Compose(purpose) => self.compose_key(purpose, key),
             Mode::List => self.list_key(key),
@@ -707,7 +951,10 @@ impl Inbox {
         }
         let threads: usize =
             self.list.as_ref().map_or(0, |l| l.sections.iter().map(|s| s.threads.len()).sum());
-        format!("Inbox · {threads} threads · {}", self.url)
+        let filter = self.project_filter.as_deref().map_or(String::new(), |id| format!(" · project {id}"));
+        let agent =
+            self.agent_filter.as_ref().map_or(String::new(), |filter| format!(" · agent {}", filter.name));
+        format!("Inbox · {threads} threads{filter}{agent} · {}", self.url)
     }
 }
 
@@ -751,6 +998,7 @@ mod tests {
     fn model(thread_id: &str, messages: Vec<Message>) -> ThreadModel {
         ThreadModel {
             server_session: String::new(),
+            cursor: 0,
             thread: Thread { thread_id: thread_id.to_owned(), messages, ..Thread::default() },
         }
     }
@@ -770,6 +1018,23 @@ mod tests {
 
     fn press(inbox: &mut Inbox, code: KeyCode) -> Vec<Request> {
         inbox.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn help_and_features_share_one_overlay() {
+        let mut inbox = Inbox::new("http://127.0.0.1:1".to_owned());
+        assert!(press(&mut inbox, KeyCode::F(1)).is_empty());
+        assert_eq!(inbox.overlay, Overlay::Help);
+        assert!(press(&mut inbox, KeyCode::F(2)).is_empty());
+        assert_eq!(inbox.overlay, Overlay::Help);
+        assert!(press(&mut inbox, KeyCode::Esc).is_empty());
+        assert_eq!(inbox.overlay, Overlay::Closed);
+        assert!(press(&mut inbox, KeyCode::F(2)).is_empty());
+        assert_eq!(inbox.overlay, Overlay::Features(0));
+        assert!(press(&mut inbox, KeyCode::Down).is_empty());
+        assert_eq!(inbox.overlay, Overlay::Features(1));
+        assert!(press(&mut inbox, KeyCode::F(2)).is_empty());
+        assert_eq!(inbox.overlay, Overlay::Closed);
     }
 
     #[test]
@@ -868,5 +1133,45 @@ mod tests {
         assert!(inbox.unconfirmed().is_none());
         let fresh = one_send(inbox.send("new words"));
         assert_ne!(fresh[0].idempotency_key, first[0].idempotency_key);
+    }
+
+    #[test]
+    fn feature_navigation_cannot_overtake_an_unconfirmed_send() {
+        let mut inbox = inbox_with(vec![asked("msg_1", "s1", vec![question("q1", State::Picked)])]);
+        let sent = one_send(inbox.send("words"));
+        inbox.send_failed(0, sent, "timed out", false);
+        assert!(press(&mut inbox, KeyCode::F(2)).is_empty());
+        assert_eq!(inbox.overlay, Overlay::Closed);
+        assert!(press(&mut inbox, KeyCode::Char('L')).is_empty());
+        assert!(press(&mut inbox, KeyCode::Char('/')).is_empty());
+        assert!(inbox.has_unconfirmed());
+    }
+
+    #[test]
+    fn permission_cards_never_enter_generic_pick_or_reply_targets() {
+        let mut inbox = inbox_with(vec![asked("permission", "perm:s1", vec![question("q1", State::Picked)])]);
+        let thread = inbox.thread.as_mut().expect("thread");
+        thread.focus_step(true);
+        assert!(thread.focus().is_none());
+        assert!(send::targets(&thread.model.thread, "words").is_empty());
+        assert!(send::targets(&thread.model.thread, "").is_empty());
+    }
+
+    #[test]
+    fn restart_never_replays_an_old_unconfirmed_send() {
+        let mut inbox = inbox_with(vec![asked("msg_1", "s1", vec![question("q1", State::Picked)])]);
+        let first = one_send(inbox.send("words"));
+        inbox.send_failed(0, first, "timed out", false);
+        inbox.restarting();
+        inbox.writes_ready = true;
+        assert!(inbox.send("").is_empty());
+        assert!(inbox.has_unconfirmed());
+        assert!(inbox.status.as_deref().is_some_and(|status| status.contains("restart")));
+        assert!(press(&mut inbox, KeyCode::Char('D')).is_empty());
+        assert!(inbox.has_unconfirmed());
+        assert!(press(&mut inbox, KeyCode::Char('D')).is_empty());
+        assert!(!inbox.has_unconfirmed());
+        let fresh = one_send(inbox.send("new words"));
+        assert_eq!(fresh[0].words.as_deref(), Some("new words"));
     }
 }

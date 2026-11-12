@@ -121,13 +121,48 @@ plannotator-tui inbox --snapshot 120 40
 ```
 
 In the list, use `j`/`k` or arrow keys to move, `Enter` to open a thread or fold a section,
-and `q` to quit. In a thread, `Tab` moves between question cards, arrows select a choice,
-and `Enter` saves the pick. Use `o` for Other, `t` for a text answer, `N` for a note,
-`x` to clear a pick, `s` to send saved picks, or `r` to write and send a reply. `Esc`
-returns to the list. Picks are saved before Send; they do not reach the recipient until sent.
+and `q` to quit. **`F2` opens the feature menu; `?` or `F1` opens keyboard help.** `/` opens
+server-backed search and `L` opens session controls. The feature menu works on the selected
+list row or open thread; entries needing a thread say so when no thread is selected.
 
-Action items are shown read-only. The thread view shows message Markdown as sent, followed by
-the server's question cards; file annotation and other Inbox actions remain in Plannotator.
+The menu includes Board, sessions/terminal/permissions, attachments, message notes, question
+references, pull requests, guided reviews, thread actions, search, decisions, agents,
+projects, Ask AI, reply drafts, artifacts, Shapes/System, media, machines/outbox, history,
+sharing/export, settings, agent icons, and updates. Each pane shows its own controls.
+Board and PR panes keep refreshing from the event stream while open. Project and agent
+filters apply to the main thread list; clear them in their corresponding feature pane.
+
+In a thread, `Tab` moves between question cards, arrows select a choice, and `Enter` saves
+the pick. Use `o` for Other, `t` for a text answer, `N` for a note, and `x` to clear a pick.
+`s` sends saved picks, staged action outcomes, and pending annotations—not saved reply-draft
+words or uploaded reply files. `r` opens the saved reply draft; Enter sends the displayed
+words with its files/recipients. Picks and staged annotations do not reach the recipient
+until Send. Session permission requests are handled only under `L`, with their own confirmation.
+
+Reply text is saved after a typing pause and on leaving the composer. `F2` inside the reply
+composer opens the richer draft editor without replacing unsaved local text. It supports
+recipient choices, `Ctrl-M` tag mode, `Ctrl-U` upload, `Ctrl-F` file management, and explicit
+Keep mine / Use saved conflict resolution. Ask AI suggestions and media transcripts enter
+the composer as text; they are never sent automatically.
+
+Thread actions include read/unread/seen, archive/restore, snooze, pin/order, acknowledgement,
+reactions, question skipping, and action Done/Can't/note/undo. Attachments and message notes
+embed the existing annotation editor in the same terminal. Pending message comments route
+to the original author's session; file and guide feedback travel with the final reply.
+Question references resolve attached prototypes and checked live-site frames rather than
+executing a supplied target. Rendered interactive HTML/diagrams use the upstream browser
+viewer; the terminal supports source annotation rather than graphical element pins.
+
+PR review uses `M` for confirmed merge, `R` for risk controls, `H` for ownership handoff,
+and `g` for verified guide-comment transfer where the selected PR supports them. Guided
+reviews provide their own walkthrough, comment, verdict, and export controls.
+
+If a send is unconfirmed, `s` retries the **same payload and idempotency key**. `D` twice
+discards it, with a warning that it may already have arrived. Feature panes cannot mutate
+the thread until that send is resolved. Held/outbox replies are shown as unconfirmed, never
+as delivered. A verified server restart rereads state before allowing writes; an old
+unconfirmed send is not automatically replayed across the restart. `--snapshot` remains
+GET-only: no event stream, seen marks, draft saves, picks, replies, or feature actions.
 
 ### Approval gate
 

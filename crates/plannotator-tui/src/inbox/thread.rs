@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use super::card::{self, Card, Shown};
 use super::client::{Message, ThreadModel};
 use super::format::{ago, author};
-use super::questions::{Answer, Kind, Question, State};
+use super::questions::{Answer, Kind, Question};
 use crate::doc::Document;
 use crate::layout::DocLayout;
 use crate::theme::palette;
@@ -30,6 +30,7 @@ pub(crate) struct ThreadView {
     bodies: HashMap<String, Vec<Line<'static>>>,
     lines: Vec<Line<'static>>,
     cards: Vec<Card>,
+    message_rows: HashMap<String, usize>,
     pub(crate) scroll: usize,
     focus: Option<Focus>,
     /// Picks the person made here, by `message id/key`, until the server has them.
@@ -55,6 +56,7 @@ impl ThreadView {
             bodies: HashMap::new(),
             lines: Vec::new(),
             cards: Vec::new(),
+            message_rows: HashMap::new(),
             scroll: 0,
             focus: None,
             drafts: HashMap::new(),
@@ -69,6 +71,37 @@ impl ThreadView {
 
     pub(crate) fn lines(&self) -> &[Line<'static>] {
         &self.lines
+    }
+
+    pub(crate) fn jump_message(&mut self, message_id: &str) {
+        if let Some(row) = self.message_rows.get(message_id).copied() {
+            self.focus = None;
+            self.scroll = row;
+        }
+    }
+
+    /// Highest message sequence whose header or body is actually in the visible viewport.
+    pub(crate) fn displayed_through(&self, height: usize) -> Option<u64> {
+        let bottom = self.scroll.saturating_add(height);
+        self.model
+            .thread
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(index, message)| {
+                let first = self.message_rows.get(&message.id).copied().unwrap_or(usize::MAX);
+                let end = self
+                    .model
+                    .thread
+                    .messages
+                    .get(index + 1)
+                    .and_then(|next| self.message_rows.get(&next.id))
+                    .copied()
+                    .unwrap_or(self.lines.len());
+                first < bottom && end > self.scroll
+            })
+            .filter_map(|(_, message)| message.seq)
+            .max()
     }
 
     pub(crate) fn focus(&self) -> Option<Focus> {
@@ -127,16 +160,25 @@ impl ThreadView {
         let width = self.width;
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut cards: Vec<Card> = Vec::new();
+        self.message_rows.clear();
         for (index, message) in self.model.thread.messages.iter().enumerate() {
             if index > 0 {
                 lines.push(Line::default());
             }
+            self.message_rows.insert(message.id.clone(), lines.len());
             lines.push(message_header(message, now, width));
             let body =
                 self.bodies.entry(message.id.clone()).or_insert_with(|| render_body(&message.body, width));
             if !body.is_empty() {
                 lines.push(Line::default());
                 lines.extend(body.iter().cloned());
+            }
+            let permission = super::send::is_permission(message);
+            if permission {
+                lines.push(Line::from(Span::styled(
+                    "Permission request · L opens session controls with confirmation",
+                    Style::new().fg(palette().comment),
+                )));
             }
             for question in ordered(message) {
                 let answer = self
@@ -162,7 +204,7 @@ impl ThreadView {
                     first,
                     last: lines.len().saturating_sub(1),
                     rows: rows.into_iter().map(|r| r + first).collect(),
-                    answerable: card::answerable(question),
+                    answerable: !permission && card::answerable(question),
                 });
             }
         }
@@ -278,10 +320,6 @@ impl ThreadView {
     pub(crate) fn draft(&mut self, message_id: &str, key: &str, answer: Answer) {
         self.drafts.insert(draft_key(message_id, key), answer);
         self.relayout();
-    }
-
-    pub(crate) fn has_picks(&self) -> bool {
-        self.model.thread.messages.iter().flat_map(|m| &m.questions).any(|q| q.state == State::Picked)
     }
 
     pub(crate) fn open_questions(&self) -> usize {

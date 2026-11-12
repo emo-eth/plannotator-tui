@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr as _;
 
 use super::client::Row;
 use super::format::{ago, author, title};
-use super::ui::{ComposeFor, Entry, Inbox, LiveState, Mode};
+use super::ui::{ComposeFor, Entry, Inbox, LiveState, Mode, Overlay};
 use crate::theme::palette;
 
 const COMPOSE_WIDTH: u16 = 64;
@@ -73,6 +73,11 @@ impl Inbox {
         self.draw_footer(frame, footer);
         if let Mode::Compose(purpose) = self.mode.clone() {
             self.draw_compose(frame, &purpose);
+        }
+        match self.overlay {
+            Overlay::Closed => {}
+            Overlay::Features(cursor) => self.draw_features(frame, cursor),
+            Overlay::Help => Self::draw_help(frame),
         }
     }
 
@@ -139,13 +144,15 @@ impl Inbox {
     /// The key help for where the person is, in the footer's right half.
     fn help(&self) -> &'static str {
         match &self.mode {
-            Mode::List => "↑↓ move · enter open · ← fold · r refresh · q quit",
-            Mode::Compose(_) if self.shift_enter => "enter sends · shift+enter new line · esc cancels",
-            Mode::Compose(_) => "enter sends · alt+enter new line · esc cancels",
+            Mode::List => "↑↓ move · enter open · / search · F2 features · ? help · q quit",
+            Mode::Compose(_) if self.shift_enter => {
+                "enter submits · shift+enter new line · F2 draft · esc cancels"
+            }
+            Mode::Compose(_) => "enter submits · alt+enter new line · F2 draft · esc cancels",
             Mode::Thread if self.thread.as_ref().is_some_and(|t| t.focus().is_some()) => {
                 "↑↓ choice · enter pick · 1-9 pick · o other · t text · N note · x clear · tab next · esc done"
             }
-            Mode::Thread => "↑↓ scroll · tab question · r reply · s send picks · R refresh · esc back",
+            Mode::Thread => "tab question · r reply · s send · F2 features · ? help · esc back",
         }
     }
 
@@ -221,6 +228,78 @@ impl Inbox {
         let cursor_x = inner.x + 1 + cursor_col as u16;
         let cursor_y = inner.y + (cursor_row - scroll) as u16;
         frame.set_cursor_position((cursor_x.min(inner.right().saturating_sub(1)), cursor_y));
+    }
+
+    fn draw_features(&self, frame: &mut Frame, cursor: usize) {
+        let area = frame.area();
+        let width = area.width.saturating_sub(4).min(84);
+        let height = area.height.saturating_sub(2).min(super::features::ALL.len() as u16 + 2);
+        let rect = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, rect);
+        let block = Block::bordered().title(" Inbox features · ↑↓ enter · esc back ");
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        let start = cursor.saturating_sub(usize::from(inner.height).saturating_sub(1));
+        for (index, feature) in
+            super::features::ALL.iter().enumerate().skip(start).take(usize::from(inner.height))
+        {
+            let unavailable = feature.needs_thread() && self.context_thread_id().is_none();
+            let style = if index == cursor {
+                palette().selection
+            } else if unavailable {
+                Style::new().dim()
+            } else {
+                Style::default()
+            };
+            let text = format!(" {}{}", feature.label(), if unavailable { " (select a thread)" } else { "" });
+            frame.render_widget(
+                Paragraph::new(text).style(style),
+                Rect::new(inner.x, inner.y + (index - start) as u16, inner.width, 1),
+            );
+        }
+    }
+
+    fn draw_help(frame: &mut Frame) {
+        let area = frame.area();
+        frame.render_widget(Clear, area);
+        let lines = vec![
+            "Inbox · keyboard help",
+            "",
+            "F2  All features: board, sessions, attachments, PRs, reviews, actions,",
+            "    search, decisions, agents, projects, Ask AI, drafts, artifacts,",
+            "    Shapes/System, media, machines, history, sharing, settings and updates.",
+            "/   Search                         L   Sessions / permission requests",
+            "",
+            "List: ↑↓ or j/k move; Enter opens / folds; ← folds; r refreshes.",
+            "Thread: ↑↓ scroll; PgUp/PgDn page; Home/End; R refreshes; Esc back.",
+            "Questions: Tab / Shift+Tab next / previous; ↑↓ choice; Enter or 1–9 pick;",
+            "           o Other; t text; N note; x clear; Esc leaves the card.",
+            "r writes a reply; s sends saved picks, staged actions and annotations.",
+            "s excludes saved reply words/files. r opens them; Enter sends visible reply.",
+            "Reply drafts, files, recipients and conflicts: F2 → Reply draft (also F2 in compose).",
+            "Linked-machine drafts survive closing/reopening a thread, but not quitting.",
+            "Permission requests must use L; generic picks never grant permissions.",
+            "Action item Done / Can't / notes / undo are under F2 → Thread actions.",
+            "Compose: Enter submits; Shift+Enter (or Alt+Enter) adds a line; Esc cancels.",
+            "",
+            "An unconfirmed send is frozen: s retries its original key and payload.",
+            "D twice discards it (it may already have arrived); do not resend as new.",
+            "Feature panels stay closed while a send is unconfirmed.",
+            "--snapshot is GET-only: no event stream, picks, replies or seen writes.",
+            "",
+            "Esc / ? / F1 closes this help. Ctrl+C quits.",
+        ];
+        frame.render_widget(
+            Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                .block(Block::bordered().title(" Help "))
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            area,
+        );
     }
 }
 

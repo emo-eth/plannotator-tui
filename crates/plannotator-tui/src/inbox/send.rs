@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use super::actions::{ActionRef, ReplyTag};
 use super::client::{Message, Pick, Thread};
 use super::questions::State;
 
@@ -16,12 +17,21 @@ const PERMISSION_SESSION: &str = "perm:";
 /// One reply of a Send, with the idempotency key it was given when the Send was made. A
 /// Send the server did not confirm is replayed reply for reply, keys included, so a reply
 /// the server wrote but never answered for is answered with that reply, not written twice.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Target {
     pub(crate) message_id: String,
     pub(crate) questions: Vec<Pick>,
     pub(crate) words: Option<String>,
     pub(crate) idempotency_key: String,
+    pub(crate) actions: Vec<ActionRef>,
+    pub(crate) annotation_ids: Vec<String>,
+    pub(crate) uploads: Vec<String>,
+    pub(crate) feedback: Option<String>,
+    pub(crate) to: Option<super::client::Addressee>,
+    pub(crate) clear_draft: Option<String>,
+    pub(crate) tags: Vec<ReplyTag>,
+    /// Enriched once before the first POST; retries never read a different payload.
+    pub(crate) prepared: bool,
 }
 
 /// A key no other Send of this process has used.
@@ -41,7 +51,7 @@ fn is_person(message: &Message) -> bool {
     message.author.kind == "person"
 }
 
-fn is_permission(message: &Message) -> bool {
+pub(crate) fn is_permission(message: &Message) -> bool {
     message.author.session.as_deref().is_some_and(|s| s.starts_with(PERMISSION_SESSION))
 }
 
@@ -105,10 +115,14 @@ pub(crate) fn words_message(thread: &Thread) -> Option<&Message> {
         return later
             .iter()
             .rev()
-            .find(|m| is_agent(m) && m.author.session.as_deref() == owner)
+            .find(|m| is_agent(m) && !is_permission(m) && m.author.session.as_deref() == owner)
             .or(Some(handoff));
     }
-    messages.iter().rev().find(|m| is_agent(m) && !is_permission(m)).or_else(|| messages.first())
+    messages
+        .iter()
+        .rev()
+        .find(|m| is_agent(m) && !is_permission(m))
+        .or_else(|| messages.iter().find(|m| !is_permission(m)))
 }
 
 /// The replies one Send makes, in thread order, the one carrying `words` last, each with a
@@ -117,11 +131,11 @@ pub(crate) fn words_message(thread: &Thread) -> Option<&Message> {
 pub(crate) fn targets(thread: &Thread, words: &str) -> Vec<Target> {
     let mut groups: HashMap<String, Target> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
-    for message in thread.messages.iter().filter(|m| is_agent(m)) {
+    for message in thread.messages.iter().filter(|m| is_agent(m) && !is_permission(m)) {
         let picks: Vec<Pick> = message
             .questions
             .iter()
-            .filter(|q| q.state == State::Picked)
+            .filter(|q| q.state == State::Picked && q.kind != super::questions::Kind::Action)
             .map(|q| Pick {
                 message_id: Some(message.id.clone()),
                 key: q.key.clone(),
@@ -129,7 +143,17 @@ pub(crate) fn targets(thread: &Thread, words: &str) -> Vec<Target> {
                 answer: None,
             })
             .collect();
-        if picks.is_empty() {
+        let actions: Vec<ActionRef> = message
+            .questions
+            .iter()
+            .filter(|question| {
+                question.action_result.as_ref().is_some_and(|result| {
+                    result.in_draft(question.state, question.revision, question.sent_revision)
+                })
+            })
+            .map(|question| ActionRef { message_id: Some(message.id.clone()), key: question.key.clone() })
+            .collect();
+        if picks.is_empty() && actions.is_empty() {
             continue;
         }
         let key = group_key(message);
@@ -140,9 +164,11 @@ pub(crate) fn targets(thread: &Thread, words: &str) -> Vec<Target> {
                 questions: Vec::new(),
                 words: None,
                 idempotency_key: new_key(),
+                ..Target::default()
             }
         });
         target.questions.extend(picks);
+        target.actions.extend(actions);
         target.message_id.clone_from(&message.id);
     }
     let mut targets: Vec<Target> = order.into_iter().filter_map(|key| groups.remove(&key)).collect();
@@ -150,6 +176,11 @@ pub(crate) fn targets(thread: &Thread, words: &str) -> Vec<Target> {
         for pick in &mut target.questions {
             if pick.message_id.as_deref() == Some(target.message_id.as_str()) {
                 pick.message_id = None;
+            }
+        }
+        for action in &mut target.actions {
+            if action.message_id.as_deref() == Some(target.message_id.as_str()) {
+                action.message_id = None;
             }
         }
     }
@@ -174,6 +205,7 @@ pub(crate) fn targets(thread: &Thread, words: &str) -> Vec<Target> {
                 questions: Vec::new(),
                 words,
                 idempotency_key: new_key(),
+                ..Target::default()
             });
         }
         None => {}

@@ -5,7 +5,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::questions::{Answer, Kind, Question, State};
+use super::questions::{Answer, Kind, Question, ShowsKind, State};
 use crate::theme::palette;
 use crate::wrap::wrap_line;
 
@@ -68,6 +68,18 @@ fn border_color(state: State) -> Color {
         State::Picked => palette().accent,
         State::Sent => palette().looks_good,
         State::Closed | State::Superseded | State::Unknown => palette().idle_fg,
+    }
+}
+
+fn reference_words(prefix: &str, label: &str, target: &str) -> Option<String> {
+    let label = label.trim();
+    let target = target.trim();
+    match (label.is_empty(), target.is_empty()) {
+        (true, true) => None,
+        (true, false) => Some(format!("{prefix}: {target}")),
+        (false, true) => Some(format!("{prefix}: {label}")),
+        (false, false) if label == target => Some(format!("{prefix}: {target}")),
+        (false, false) => Some(format!("{prefix}: {label} — {target}")),
     }
 }
 
@@ -180,6 +192,72 @@ pub(crate) fn lines(
     if let Some(stakes) = question.stakes.as_deref().filter(|s| !s.trim().is_empty()) {
         b.paragraph(&format!("Stakes: {stakes}"), Style::new().dim());
     }
+    if let Some(reversible) = question.reversible.as_ref().filter(|r| !r.value) {
+        let warning = match reversible.why.as_deref().map(str::trim).filter(|why| !why.is_empty()) {
+            Some(why) => format!("Can't be undone: {why}"),
+            None => "Can't be undone".to_owned(),
+        };
+        b.paragraph(&warning, Style::new().fg(palette().delete));
+    }
+    if let Some(shows) = &question.shows {
+        let prefix = match shows.kind {
+            ShowsKind::Image => "Shows (image)",
+            ShowsKind::Link => "Shows (file/link)",
+            ShowsKind::Unknown => "Shows",
+        };
+        if let Some(words) = reference_words(prefix, &shows.label, &shows.src) {
+            b.paragraph(&words, Style::new().dim());
+        }
+    }
+    if let Some(prototype) = &question.prototype
+        && let Some(words) =
+            reference_words("Prototype", prototype.label.as_deref().unwrap_or_default(), &prototype.target)
+    {
+        b.paragraph(&words, Style::new().dim());
+    }
+    if let Some(attachment) = &question.attachment {
+        let mut source = format!("Question in file: Q{}", question.position.saturating_add(1));
+        if !attachment.key.is_empty() {
+            source.push_str(" · ");
+            source.push_str(&attachment.key);
+        }
+        b.paragraph(&source, Style::new().dim());
+    }
+    let answer = shown.answer;
+    answer_lines(&mut b, question, shown, color);
+    if let Some(why) = question.why.as_deref().map(str::trim).filter(|why| !why.is_empty()) {
+        let mut words = String::from("Why");
+        let mut first = true;
+        for choice in question.choices.iter().filter(|choice| choice.recommended) {
+            words.push_str(if first { " " } else { ", " });
+            words.push_str(&choice.label);
+            first = false;
+        }
+        words.push_str(": ");
+        words.push_str(why);
+        b.paragraph(&words, Style::new().dim());
+    }
+    if let Some(note) = answer.note.as_deref().filter(|n| !n.trim().is_empty()) {
+        b.paragraph(&format!("Note: {note}"), Style::new().fg(palette().comment));
+    }
+    if question.kind != Kind::Action && !matches!(question.state, State::Open | State::Picked) {
+        b.paragraph(&question.summary(), Style::new().fg(color));
+    }
+    if let Some(stopped) = question.stopped.as_deref().filter(|s| !s.trim().is_empty()) {
+        b.paragraph(&format!("Stopped: {stopped}"), Style::new().fg(palette().delete));
+    }
+    if !question.holds_up.is_empty() {
+        b.paragraph(
+            &format!("Holds up: {}", question.holds_up.join(", ")),
+            Style::new().fg(palette().delete).dim(),
+        );
+    }
+    let bottom = "╰".to_owned() + &"─".repeat(width.saturating_sub(1));
+    b.lines.push(Line::from(vec![Span::styled(bottom, border.dim())]));
+    (b.lines, b.rows)
+}
+
+fn answer_lines(b: &mut Builder, question: &Question, shown: &Shown<'_>, color: Color) {
     let answer = shown.answer;
     match question.kind {
         Kind::Single | Kind::Multi => {
@@ -198,6 +276,20 @@ pub(crate) fn lines(
                 }
                 let style = if choice.settled { Style::new().dim() } else { Style::new() };
                 b.entry(lead, &label, style, shown.focus == Some(index));
+                if let Some(image) = &choice.image
+                    && let Some(words) = reference_words("Image", &image.alt, &image.src)
+                {
+                    b.aside(&words);
+                }
+                if let Some(prototype) = &choice.prototype
+                    && let Some(words) = reference_words(
+                        "Prototype",
+                        prototype.label.as_deref().unwrap_or_default(),
+                        &prototype.target,
+                    )
+                {
+                    b.aside(&words);
+                }
                 for pro in &choice.pros {
                     b.aside(&format!("+ {pro}"));
                 }
@@ -232,31 +324,95 @@ pub(crate) fn lines(
                 b.entry(lead, &hint, Style::new().dim(), shown.focus == Some(0));
             }
         }
-        Kind::Action | Kind::Unknown => {}
+        Kind::Action => {
+            if let Some(action) = &question.action {
+                if let Some(words) = reference_words(
+                    "Where",
+                    action.where_.as_deref().unwrap_or_default(),
+                    action.where_url.as_deref().unwrap_or_default(),
+                ) {
+                    b.paragraph(&words, Style::new().dim());
+                }
+                for (label, text) in [("Run", &action.run), ("Watching", &action.watching)] {
+                    if let Some(text) = text.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+                        b.paragraph(&format!("{label}: {text}"), Style::new().dim());
+                    }
+                }
+            }
+            if let Some(result) = &question.action_result {
+                let outcome = match &result.outcome {
+                    super::actions::ActionOutcome::Done => "Done",
+                    super::actions::ActionOutcome::Cant => "Can't do it",
+                };
+                let by = if result.by == "agent" { "agent" } else { "you" };
+                let in_draft = result.in_draft(question.state, question.revision, question.sent_revision);
+                let mut status = format!("{outcome} · {by}");
+                if in_draft {
+                    status.push_str(" · in reply draft");
+                }
+                b.paragraph(&status, Style::new().fg(color));
+                if let Some(note) = result.note.as_deref().map(str::trim).filter(|note| !note.is_empty()) {
+                    b.paragraph(&format!("Note: {note}"), Style::new().fg(palette().comment));
+                }
+                if result.by == "agent"
+                    && let Some(note) = result.person.as_ref().and_then(|person| person.note.as_deref())
+                    && !note.trim().is_empty()
+                {
+                    b.paragraph(&format!("Your note: {}", note.trim()), Style::new().fg(palette().comment));
+                }
+            }
+        }
+        Kind::Unknown => {}
     }
-    if let Some(note) = answer.note.as_deref().filter(|n| !n.trim().is_empty()) {
-        b.paragraph(&format!("Note: {note}"), Style::new().fg(palette().comment));
-    }
-    if !matches!(question.state, State::Open | State::Picked) {
-        b.paragraph(&question.summary(), Style::new().fg(color));
-    }
-    if let Some(stopped) = question.stopped.as_deref().filter(|s| !s.trim().is_empty()) {
-        b.paragraph(&format!("Stopped: {stopped}"), Style::new().fg(palette().delete));
-    }
-    if !question.holds_up.is_empty() {
-        b.paragraph(
-            &format!("Holds up: {}", question.holds_up.join(", ")),
-            Style::new().fg(palette().delete).dim(),
-        );
-    }
-    let bottom = "╰".to_owned() + &"─".repeat(width.saturating_sub(1));
-    b.lines.push(Line::from(vec![Span::styled(bottom, border.dim())]));
-    (b.lines, b.rows)
 }
+
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::indexing_slicing, reason = "tests assert by panicking")]
 mod tests {
-    use super::answerable;
-    use crate::inbox::questions::{Kind, Question, State};
+    use super::{Shown, answerable, lines};
+    use crate::inbox::questions::{Answer, Kind, Question, State};
+    use ratatui::text::Line;
+    use serde_json::json;
+
+    fn row_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    fn rendered(
+        question: &Question,
+        answer: &Answer,
+        focus: Option<usize>,
+    ) -> (Vec<Line<'static>>, Vec<usize>) {
+        lines(question, &Shown { number: 7, answer, drafted: false, focus }, 160)
+    }
+
+    fn detailed_question() -> Question {
+        serde_json::from_value(json!({
+            "key": "q-layout-2",
+            "kind": "single",
+            "state": "open",
+            "position": 1,
+            "prompt": "Which layout?",
+            "stakes": "Checkout ships tomorrow.",
+            "shows": {"kind": "image", "label": "Both layouts", "src": "both.png"},
+            "why": "The total stays visible.",
+            "reversible": {"value": false, "why": "The previous layout is removed."},
+            "prototype": {"target": "shared.html", "label": "Compare layouts"},
+            "attachment": {"id": "att_plan", "name": "plan.md", "key": "q-layout"},
+            "choices": [{
+                "label": "Pinned total",
+                "recommended": true,
+                "image": {"alt": "Pinned checkout", "src": "pinned.png"},
+                "prototype": {"target": "http://localhost:3000/pinned", "label": "Try pinned"},
+                "pros": ["Always visible"],
+                "cons": ["Less space"]
+            }, {
+                "label": "Floating total",
+                "prototype": {"target": "floating.html"}
+            }]
+        }))
+        .expect("question fixture")
+    }
 
     #[test]
     fn orphaned_question_is_not_answerable() {
@@ -264,5 +420,171 @@ mod tests {
             Question { kind: Kind::Single, state: State::Open, orphaned: true, ..Question::default() };
 
         assert!(!answerable(&question));
+    }
+
+    #[test]
+    fn renders_server_details_without_adding_answer_rows() {
+        let question = detailed_question();
+        let answer = Answer { selected: vec!["Pinned total".to_owned()], ..Answer::default() };
+        let (rendered, rows) = rendered(&question, &answer, Some(1));
+        let text = rendered.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        for detail in [
+            "in plan.md",
+            "Question in file: Q2 · q-layout",
+            "Stakes: Checkout ships tomorrow.",
+            "Shows (image): Both layouts — both.png",
+            "Can't be undone: The previous layout is removed.",
+            "Prototype: Compare layouts — shared.html",
+            "Prototype: Try pinned — http://localhost:3000/pinned",
+            "Prototype: floating.html",
+            "Image: Pinned checkout — pinned.png",
+            "+ Always visible",
+            "− Less space",
+            "Why Pinned total: The total stays visible.",
+        ] {
+            assert!(text.contains(detail), "missing {detail:?} from {text}");
+        }
+        assert_eq!(rows.len(), 3);
+        assert!(row_text(&rendered[rows[0]]).contains("(x) Pinned total"));
+        assert!(row_text(&rendered[rows[1]]).contains("( ) Floating total"));
+        assert!(row_text(&rendered[rows[2]]).contains("Other… (o)"));
+        assert!(answerable(&question));
+    }
+
+    #[test]
+    fn renders_file_links_and_why_without_a_recommendation() {
+        let question: Question = serde_json::from_value(json!({
+            "kind": "text",
+            "state": "open",
+            "prompt": "What should change?",
+            "shows": {"kind": "link", "label": "Design notes", "src": "design.md"},
+            "why": "Keep checkout simple.",
+            "reversible": {"value": false, "why": null},
+            "prototype": {"target": "shared.html"}
+        }))
+        .expect("text question fixture");
+        let answer = Answer { text: Some("Keep the total pinned".to_owned()), ..Answer::default() };
+        let (rendered, rows) = rendered(&question, &answer, Some(0));
+        let text = rendered.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Shows (file/link): Design notes — design.md"));
+        assert!(text.contains("Why: Keep checkout simple."));
+        assert!(text.contains("Can't be undone"));
+        assert!(!text.contains("Can't be undone:"));
+        assert!(text.contains("Prototype: shared.html"));
+        assert_eq!(rows.len(), 1);
+        assert!(row_text(&rendered[rows[0]]).contains("Keep the total pinned"));
+        assert!(answerable(&question));
+    }
+
+    #[test]
+    fn details_wrap_without_displacing_choice_focus() {
+        let question = detailed_question();
+        let answer = Answer::default();
+        let shown = Shown { number: 7, answer: &answer, drafted: false, focus: Some(1) };
+        let (rendered, rows) = lines(&question, &shown, 32);
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0] < rows[1] && rows[1] < rows[2]);
+        assert!(row_text(&rendered[rows[0]]).contains("Pinned total"));
+        assert!(row_text(&rendered[rows[1]]).contains("Floating total"));
+        let selection = crate::theme::palette().selection;
+        let choice_style = ratatui::style::Style::new().fg(crate::theme::palette().comment);
+        assert_eq!(rendered[rows[1]].spans[1].style, choice_style.patch(selection));
+        assert_ne!(rendered[rows[1] + 1].spans[1].style, choice_style.patch(selection));
+    }
+
+    #[test]
+    fn empty_optional_details_leave_older_cards_unchanged() {
+        let question: Question = serde_json::from_value(json!({
+            "kind": "single", "state": "open", "prompt": "Pick?",
+            "choices": [{"label": "A"}]
+        }))
+        .expect("older question fixture");
+        let with_empty: Question = serde_json::from_value(json!({
+            "kind": "single", "state": "open", "prompt": "Pick?",
+            "shows": {"kind": "image", "label": " ", "src": " "},
+            "why": " ",
+            "reversible": {"value": true, "why": "still reversible"},
+            "prototype": {"target": " ", "label": " "},
+            "choices": [{
+                "label": "A",
+                "image": {"alt": " ", "src": " "},
+                "prototype": {"target": " ", "label": " "}
+            }]
+        }))
+        .expect("empty optional details fixture");
+        let answer = Answer::default();
+        assert_eq!(rendered(&question, &answer, None), rendered(&with_empty, &answer, None));
+    }
+
+    #[test]
+    fn unknown_reference_kinds_and_unlabelled_images_remain_visible() {
+        let question: Question = serde_json::from_value(json!({
+            "kind": "multi", "state": "sent", "prompt": "Pick?",
+            "shows": {"kind": "future", "label": "Plan", "src": "plan.md"},
+            "why": "Both fit.",
+            "choices": [
+                {"label": "A", "recommended": true, "image": {"alt": "", "src": "a.png"}},
+                {"label": "B", "recommended": true, "prototype": {"label": "b.html", "target": "b.html"}}
+            ],
+            "answer": {"selected": ["A", "B"]}
+        }))
+        .expect("additive question fixture");
+        let answer = question.answer.as_ref().expect("saved answer");
+        let (rendered, rows) = rendered(&question, answer, None);
+        let text = rendered.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Shows: Plan — plan.md"));
+        assert!(text.contains("Image: a.png"));
+        assert!(text.contains("Prototype: b.html"));
+        assert!(!text.contains("b.html — b.html"));
+        assert!(text.contains("Why A, B: Both fit."));
+        assert!(text.contains("Answer: A, B"));
+        assert_eq!(rows.len(), 3);
+        assert!(!answerable(&question));
+    }
+
+    #[test]
+    fn action_details_remain_read_only_and_preserve_staged_notes() {
+        let question: Question = serde_json::from_value(json!({
+            "kind": "action", "state": "picked", "prompt": "Approve the release",
+            "revision": 2, "sent_revision": 0,
+            "action": {
+                "where": "Release dashboard", "where_url": "https://example.com/release",
+                "run": "release inspect", "watching": "The approval status"
+            },
+            "action_result": {
+                "outcome": "cant", "by": "person", "note": "Need access first", "staged": true,
+                "at": "2026-11-11T12:00:00Z", "message_id": null, "person": null
+            }
+        }))
+        .expect("staged action fixture");
+        let (rendered, rows) = rendered(&question, &Answer::default(), None);
+        let text = rendered.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Where: Release dashboard — https://example.com/release"));
+        assert!(text.contains("Run: release inspect"));
+        assert!(text.contains("Watching: The approval status"));
+        assert!(text.contains("Can't do it · you · in reply draft"));
+        assert!(text.contains("Note: Need access first"));
+        assert!(rows.is_empty());
+        assert!(!answerable(&question));
+    }
+
+    #[test]
+    fn agent_completed_actions_show_the_preserved_person_note() {
+        let question: Question = serde_json::from_value(json!({
+            "kind": "action", "state": "closed", "prompt": "Approve the release",
+            "revision": 2, "sent_revision": 0,
+            "action_result": {
+                "outcome": "done", "by": "agent", "note": null,
+                "at": "2026-11-11T12:01:00Z", "message_id": "msg_done", "staged": false,
+                "person": {"outcome": "cant", "note": "Need access first", "at": "2026-11-11T12:00:00Z"}
+            }
+        }))
+        .expect("completed action fixture");
+        let (rendered, rows) = rendered(&question, &Answer::default(), None);
+        let text = rendered.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Done · agent · in reply draft"));
+        assert!(text.contains("Your note: Need access first"));
+        assert!(!text.contains("No answer"));
+        assert!(rows.is_empty());
     }
 }

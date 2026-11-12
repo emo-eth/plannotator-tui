@@ -79,7 +79,21 @@ pub(crate) struct Question {
     #[serde(default)]
     pub(crate) revision: u64,
     #[serde(default)]
+    pub(crate) sent_revision: u64,
+    #[serde(default)]
+    pub(crate) action: Option<super::actions::ActionFacts>,
+    #[serde(default)]
+    pub(crate) action_result: Option<super::actions::ActionResult>,
+    #[serde(default)]
     pub(crate) stakes: Option<String>,
+    #[serde(default)]
+    pub(crate) shows: Option<Shows>,
+    #[serde(default)]
+    pub(crate) why: Option<String>,
+    #[serde(default)]
+    pub(crate) reversible: Option<Reversible>,
+    #[serde(default)]
+    pub(crate) prototype: Option<Prototype>,
     #[serde(default)]
     pub(crate) attachment: Option<Attachment>,
 }
@@ -96,7 +110,55 @@ impl Question {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct Attachment {
     #[serde(default)]
+    pub(crate) id: String,
+    #[serde(default)]
     pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) key: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct Prototype {
+    #[serde(default)]
+    pub(crate) target: String,
+    #[serde(default)]
+    pub(crate) label: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ShowsKind {
+    Image,
+    Link,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct Shows {
+    #[serde(default)]
+    pub(crate) kind: ShowsKind,
+    #[serde(default)]
+    pub(crate) label: String,
+    #[serde(default)]
+    pub(crate) src: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct Reversible {
+    #[serde(default)]
+    pub(crate) value: bool,
+    #[serde(default)]
+    pub(crate) why: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct Image {
+    #[serde(default)]
+    pub(crate) alt: String,
+    #[serde(default)]
+    pub(crate) src: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -113,6 +175,10 @@ pub(crate) struct Choice {
     pub(crate) pros: Vec<String>,
     #[serde(default)]
     pub(crate) cons: Vec<String>,
+    #[serde(default)]
+    pub(crate) prototype: Option<Prototype>,
+    #[serde(default)]
+    pub(crate) image: Option<Image>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -258,7 +324,7 @@ fn plain_label(label: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::indexing_slicing, reason = "tests assert by panicking")]
 mod tests {
-    use super::{Answer, Kind, Question, State};
+    use super::{Answer, Kind, Question, ShowsKind, State};
     use serde_json::json;
 
     fn question(kind: Kind) -> Question {
@@ -269,6 +335,18 @@ mod tests {
             state: State::Open,
             ..Question::default()
         }
+    }
+
+    #[test]
+    fn recorded_attachment_question_keeps_source_and_answer_identity() {
+        let question: Question = serde_json::from_str(include_str!("fixtures/attachment-question.json"))
+            .expect("recorded attachment question");
+        let attachment = question.attachment.as_ref().expect("attachment source");
+        assert_eq!(attachment.name, "attachment.md");
+        assert_eq!(attachment.key, "q-c06ee0f2");
+        assert_eq!(question.key, "q-c06ee0f2");
+        assert_eq!(question.kind, Kind::Single);
+        assert_eq!(question.choices[1].label, "Choices and selected state");
     }
 
     #[test]
@@ -291,6 +369,103 @@ mod tests {
         assert_eq!(future.kind, Kind::Unknown);
         assert_eq!(future.state, State::Unknown);
         assert!(!future.is_open());
+    }
+
+    #[test]
+    fn deserializes_question_references_without_changing_answer_payloads() {
+        let decoded: Question = serde_json::from_value(json!({
+            "key": "q-layout-2",
+            "position": 1,
+            "kind": "single",
+            "prompt": "Which layout?",
+            "state": "picked",
+            "stakes": "The checkout ships tomorrow.",
+            "shows": {"kind": "image", "label": "Both layouts", "src": "screens/both.png"},
+            "why": "The total stays visible.",
+            "reversible": {"value": false, "why": "The previous layout is removed."},
+            "prototype": {"target": "mock.html", "label": "Compare layouts"},
+            "attachment": {"id": "att_plan", "name": "plan.md", "key": "q-layout"},
+            "choices": [{
+                "label": "Pinned total",
+                "recommended": true,
+                "image": {"alt": "Pinned checkout", "src": "screens/pinned.png"},
+                "prototype": {"target": "http://localhost:3000/pinned#checkout", "label": "Try pinned"}
+            }, {
+                "label": "Floating total",
+                "prototype": {"target": "floating.html"}
+            }],
+            "answer": {"selected": ["Pinned total"], "note": "Keep the total visible"}
+        }))
+        .expect("current question wire");
+        assert_eq!(decoded.stakes.as_deref(), Some("The checkout ships tomorrow."));
+        let shows = decoded.shows.as_ref().expect("shows");
+        assert_eq!(shows.kind, ShowsKind::Image);
+        assert_eq!(shows.label, "Both layouts");
+        assert_eq!(shows.src, "screens/both.png");
+        assert_eq!(decoded.why.as_deref(), Some("The total stays visible."));
+        let reversible = decoded.reversible.as_ref().expect("one-way question");
+        assert!(!reversible.value);
+        assert_eq!(reversible.why.as_deref(), Some("The previous layout is removed."));
+        let shared = decoded.prototype.as_ref().expect("shared prototype");
+        assert_eq!(shared.target, "mock.html");
+        assert_eq!(shared.label.as_deref(), Some("Compare layouts"));
+        let own = decoded.choices[0].prototype.as_ref().expect("choice prototype");
+        assert_eq!(own.target, "http://localhost:3000/pinned#checkout");
+        assert_eq!(own.label.as_deref(), Some("Try pinned"));
+        assert!(decoded.choices[1].prototype.as_ref().expect("unlabelled prototype").label.is_none());
+        let image = decoded.choices[0].image.as_ref().expect("picture choice");
+        assert_eq!(image.alt, "Pinned checkout");
+        assert_eq!(image.src, "screens/pinned.png");
+        let attachment = decoded.attachment.as_ref().expect("source attachment");
+        assert_eq!(attachment.id, "att_plan");
+        assert_eq!(attachment.name, "plan.md");
+        assert_eq!(attachment.key, "q-layout");
+        assert_ne!(attachment.key, decoded.key);
+        assert_eq!(
+            decoded.answer.as_ref().expect("saved answer").serialize(&decoded),
+            json!({
+                "v": 1,
+                "key": "q-layout-2",
+                "kind": "single",
+                "prompt": "Which layout?",
+                "selected": ["Pinned total"],
+                "note": "Keep the total visible"
+            })
+        );
+    }
+
+    #[test]
+    fn optional_question_details_accept_older_and_additive_records() {
+        let older: Question =
+            serde_json::from_value(json!({"choices": [{"label": "A"}]})).expect("older question wire");
+        assert!(older.prototype.is_none());
+        assert!(older.shows.is_none());
+        assert!(older.reversible.is_none());
+        assert!(older.why.is_none());
+        assert!(older.attachment.is_none());
+        assert!(older.action.is_none());
+        assert!(older.action_result.is_none());
+        assert_eq!(older.sent_revision, 0);
+        assert!(older.choices[0].prototype.is_none());
+        assert!(older.choices[0].image.is_none());
+
+        for (kind, expected) in [("link", ShowsKind::Link), ("future", ShowsKind::Unknown)] {
+            let decoded: Question = serde_json::from_value(json!({
+                "shows": {"kind": kind, "label": "Plan", "src": "plan.md"},
+                "reversible": {"value": false, "why": null},
+                "prototype": null,
+                "attachment": null,
+                "action": null,
+                "action_result": null
+            }))
+            .expect("optional question details");
+            assert_eq!(decoded.shows.as_ref().expect("shows").kind, expected);
+            assert!(decoded.reversible.as_ref().expect("one-way question").why.is_none());
+            assert!(decoded.prototype.is_none());
+            assert!(decoded.attachment.is_none());
+            assert!(decoded.action.is_none());
+            assert!(decoded.action_result.is_none());
+        }
     }
 
     #[test]
