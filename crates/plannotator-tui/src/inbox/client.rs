@@ -76,6 +76,7 @@ pub(crate) struct Section {
     pub(crate) threads: Vec<Row>,
 }
 
+#[allow(clippy::struct_excessive_bools, reason = "independent flags follow the Inbox wire model")]
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct Row {
@@ -90,6 +91,7 @@ pub(crate) struct Row {
     pub(crate) last_at: String,
     pub(crate) message_count: u64,
     pub(crate) resolved_at: Option<String>,
+    pub(crate) back_from_archive: bool,
     pub(crate) unread: bool,
     pub(crate) answered_not_sent: bool,
     pub(crate) waiting_on_person: bool,

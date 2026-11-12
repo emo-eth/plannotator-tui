@@ -1,8 +1,8 @@
 //! Discoverable entry points for Inbox surfaces. All runners borrow the Inbox's terminal;
 //! opening the menu itself is pure, and a panel is entered only after an explicit key.
 //! Extended settings expose prompts, agents, sidebar, reactions, voice, tour and accounts
-//! without requiring an open thread. Display-name writes, an interactive terminal tour and
-//! account switching remain unsupported; the panel reports those limits without claiming success.
+//! without requiring an open thread. Display-name writes and account switching remain
+//! unsupported; the panel reports those limits without claiming success.
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
@@ -33,6 +33,8 @@ pub(crate) enum Feature {
     History,
     Sharing,
     Settings,
+    ProductFeedback,
+    Tour,
     SettingsExtra,
     Icons,
     Update,
@@ -60,6 +62,8 @@ pub(crate) const ALL: &[Feature] = &[
     Feature::History,
     Feature::Sharing,
     Feature::Settings,
+    Feature::ProductFeedback,
+    Feature::Tour,
     Feature::SettingsExtra,
     Feature::Icons,
     Feature::Update,
@@ -89,6 +93,8 @@ impl Feature {
             Self::History => "History · archive, activity, storage and tidy",
             Self::Sharing => "Share / export · copy Markdown, links and artifacts",
             Self::Settings => "Settings · preferences, appearance and integrations",
+            Self::ProductFeedback => "Product feedback · questions and feedback to Plannotator",
+            Self::Tour => "Guided tour · replay a fixture without touching threads",
             Self::SettingsExtra => "More settings · prompts, agents, sidebar, voice and accounts",
             Self::Icons => "Agent icons · sets, uploads and animation",
             Self::Update => "Updates · check, install and restart",
@@ -199,6 +205,8 @@ pub(crate) fn run(
         }
         Feature::Sharing => super::sharing::run(client, terminal, thread)?,
         Feature::Settings => settings(client, terminal)?,
+        Feature::ProductFeedback => super::product_feedback::run(client, terminal)?,
+        Feature::Tour => super::tour::run(client, terminal)?,
         Feature::SettingsExtra => super::settings_extra::run(client, terminal)?,
         Feature::Icons => super::main_delta::run(client, terminal)?,
         Feature::Update => super::update::run(client, terminal, thread)?,

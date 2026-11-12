@@ -31,6 +31,7 @@ mod machines;
 mod main_delta;
 mod media;
 mod navigation;
+mod product_feedback;
 mod projects;
 mod pulls;
 mod questions;
@@ -43,6 +44,7 @@ mod settings_extra;
 mod shapes;
 mod sharing;
 mod thread;
+mod tour;
 mod ui;
 mod update;
 

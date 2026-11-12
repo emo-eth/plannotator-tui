@@ -1,0 +1,9 @@
+fixture.json is copied from Plannotator's curated Inbox tour fixture:
+https://github.com/backnotprop/plannotator/blob/f83b9b6a5d35c68ef9dc8c55c750c790388ebfd2/packages/inbox/tour/content/fixture.json
+
+Upstream revision: f83b9b6a5d35c68ef9dc8c55c750c790388ebfd2
+Copyright (c) 2025 backnotprop
+
+The fixture is distributed under the MIT License. The full copyright,
+permission notice, and warranty disclaimer are included in
+../product_feedback/LICENSE-MIT, which is identical to upstream's LICENSE-MIT.

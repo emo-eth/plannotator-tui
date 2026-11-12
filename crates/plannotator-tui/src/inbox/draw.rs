@@ -119,17 +119,16 @@ impl Inbox {
                 Entry::Header(s) => {
                     let Some(section) = list.sections.get(s) else { continue };
                     let fold = if self.is_collapsed(&section.id) { "▸" } else { "▾" };
-                    let text = format!("{fold} {} ({})", section.label, section.threads.len());
+                    let count = self.section_rows.get(s).map_or(0, Vec::len);
+                    let text = format!("{fold} {} ({count})", section.label);
                     Line::from(Span::styled(
                         text,
                         Style::new().fg(section_color(&section.id)).add_modifier(Modifier::BOLD),
                     ))
                 }
-                Entry::Row(s, r) => {
-                    let Some(row) = list.sections.get(s).and_then(|section| section.threads.get(r)) else {
-                        continue;
-                    };
-                    row_line(row, now, width)
+                Entry::Row(..) => {
+                    let Some(row) = self.row(*entry) else { continue };
+                    row_line(row, now, width, self.is_pinned(&row.thread_id))
                 }
             };
             let line = if selected { line.patch_style(palette().selection) } else { line };
@@ -144,7 +143,7 @@ impl Inbox {
     /// The key help for where the person is, in the footer's right half.
     fn help(&self) -> &'static str {
         match &self.mode {
-            Mode::List => "↑↓ move · enter open · / search · F2 features · ? help · q quit",
+            Mode::List => "↑↓ move · enter open · v view · / search · F2 features · ? help · q quit",
             Mode::Compose(_) if self.shift_enter => {
                 "enter submits · shift+enter new line · F2 draft · esc cancels"
             }
@@ -276,6 +275,9 @@ impl Inbox {
             "/   Search                         L   Sessions / permission requests",
             "",
             "List: ↑↓ or j/k move; Enter opens / folds; ← folds; r refreshes.",
+            "v switches Smart groups / Simple list for this session only (no server write).",
+            "Simple list includes Quiet and Sent; Snoozed stays folded below it.",
+            "Simple list holds live row order; refresh, close or filter/view change sorts again.",
             "Thread: ↑↓ scroll; PgUp/PgDn page; Home/End; R refreshes; Esc back.",
             "Questions: Tab / Shift+Tab next / previous; ↑↓ choice; Enter or 1–9 pick;",
             "           o Other; t text; N note; x clear; Esc leaves the card.",
@@ -305,7 +307,7 @@ impl Inbox {
 
 /// One thread of the list: its title, bold while unread, and on the right what waits in it,
 /// its project and when it last moved.
-fn row_line(row: &Row, now: OffsetDateTime, width: usize) -> Line<'static> {
+fn row_line(row: &Row, now: OffsetDateTime, width: usize, pinned: bool) -> Line<'static> {
     let mut meta: Vec<String> = Vec::new();
     meta.extend(badge(row));
     meta.push(row.project.name.clone());
@@ -329,7 +331,7 @@ fn row_line(row: &Row, now: OffsetDateTime, width: usize) -> Line<'static> {
         Style::new().dim()
     };
     Line::from(vec![
-        Span::raw("  "),
+        Span::styled(if pinned { "* " } else { "  " }, Style::new().fg(palette().comment)),
         Span::styled(marker, Style::new().fg(palette().accent)),
         Span::styled(name, title_style),
         Span::raw(" ".repeat(pad)),

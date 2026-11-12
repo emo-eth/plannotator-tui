@@ -63,6 +63,26 @@ pub(crate) enum Entry {
     Row(usize, usize),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListView {
+    Grouped,
+    Simple,
+}
+
+impl ListView {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Grouped => "Smart groups",
+            Self::Simple => "Simple list",
+        }
+    }
+}
+
+struct ListPlace {
+    group: String,
+    at: String,
+}
+
 /// Whether what is on screen keeps up with the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LiveState {
@@ -85,6 +105,10 @@ pub(crate) struct Inbox {
     pub(crate) url: String,
     pub(crate) list: Option<List>,
     pub(crate) entries: Vec<Entry>,
+    pub(crate) list_view: ListView,
+    pub(crate) section_rows: Vec<Vec<usize>>,
+    places: HashMap<String, ListPlace>,
+    pinned: HashSet<String>,
     pub(crate) cursor: usize,
     pub(crate) list_scroll: usize,
     collapsed: HashSet<String>,
@@ -138,6 +162,10 @@ impl Inbox {
             url,
             list: None,
             entries: Vec::new(),
+            list_view: ListView::Grouped,
+            section_rows: Vec::new(),
+            places: HashMap::new(),
+            pinned: HashSet::new(),
             cursor: 0,
             list_scroll: 0,
             collapsed: CLOSED_BY_DEFAULT.iter().map(|s| (*s).to_owned()).collect(),
@@ -165,6 +193,13 @@ impl Inbox {
 
     pub(crate) fn loaded_list(&mut self, list: List) {
         let keep = self.selection();
+        self.pinned.clear();
+        self.pinned.extend(
+            list.sections
+                .iter()
+                .filter(|section| section.id == "pinned")
+                .flat_map(|section| section.threads.iter().map(|row| row.thread_id.clone())),
+        );
         self.list = Some(list);
         self.rebuild_entries(keep.as_ref());
     }
@@ -241,6 +276,7 @@ impl Inbox {
 
     pub(crate) fn restarting(&mut self) {
         self.writes_ready = false;
+        self.places.clear();
         if let Some(pending) = self.pending_send.as_mut() {
             pending.restarted = true;
         }
@@ -292,29 +328,59 @@ impl Inbox {
     }
 
     fn rebuild_entries(&mut self, keep: Option<&Keep>) {
+        self.section_rows = self.visible_rows();
+        let snoozed_visible = self.list.as_ref().is_some_and(|list| {
+            list.sections
+                .iter()
+                .zip(&self.section_rows)
+                .any(|(section, rows)| section.id == "snoozed" && !rows.is_empty())
+        });
+        if !snoozed_visible {
+            self.collapsed.insert("snoozed".to_owned());
+        }
         let mut entries = Vec::new();
+        if self.list_view == ListView::Simple {
+            self.update_places();
+            if let Some(list) = &self.list {
+                for (s, rows) in self.section_rows.iter().enumerate() {
+                    if list.sections.get(s).is_some_and(|section| section.id != "snoozed") {
+                        entries.extend(rows.iter().map(|r| Entry::Row(s, *r)));
+                    }
+                }
+            }
+            entries.sort_unstable_by(|left, right| {
+                let key = |entry| {
+                    let row = self.row(entry)?;
+                    Some((self.places.get(&row.thread_id)?.at.as_str(), row.thread_id.as_str()))
+                };
+                match (key(*left), key(*right)) {
+                    (Some((left_at, left_id)), Some((right_at, right_id))) => {
+                        right_at.cmp(left_at).then_with(|| left_id.cmp(right_id))
+                    }
+                    _ => std::cmp::Ordering::Equal,
+                }
+            });
+        }
         if let Some(list) = &self.list {
             for (s, section) in list.sections.iter().enumerate() {
-                if !section.threads.iter().any(|row| self.matches_project(row)) {
+                let Some(rows) = self.section_rows.get(s).filter(|rows| !rows.is_empty()) else {
+                    continue;
+                };
+                if self.list_view == ListView::Simple && section.id != "snoozed" {
                     continue;
                 }
                 entries.push(Entry::Header(s));
                 if !self.collapsed.contains(&section.id) {
-                    entries.extend(
-                        section
-                            .threads
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, row)| self.matches_project(row))
-                            .map(|(r, _)| Entry::Row(s, r)),
-                    );
+                    entries.extend(rows.iter().map(|r| Entry::Row(s, *r)));
                 }
             }
         }
         self.entries = entries;
         let found = match (keep, &self.list) {
             (Some(Keep::Row(id)), Some(_)) => {
-                self.entries.iter().position(|e| self.row_id(*e).as_deref() == Some(id.as_str()))
+                self.entries.iter().position(|e| self.row_id(*e) == Some(id.as_str())).or_else(|| {
+                    self.row_section(id).and_then(|s| self.entries.iter().position(|e| *e == Entry::Header(s)))
+                })
             }
             (Some(Keep::Header(id)), Some(list)) => self.entries.iter().position(|e| {
                 matches!(e, Entry::Header(s) if list.sections.get(*s).is_some_and(|section| section.id == *id))
@@ -322,22 +388,119 @@ impl Inbox {
             _ => None,
         };
         self.cursor = found.unwrap_or(self.cursor).min(self.entries.len().saturating_sub(1));
+        self.ensure_cursor_visible(self.body_height);
     }
 
-    fn row_id(&self, entry: Entry) -> Option<String> {
-        match entry {
-            Entry::Row(s, r) => {
-                self.list.as_ref()?.sections.get(s)?.threads.get(r).map(|row| row.thread_id.clone())
+    fn visible_rows(&self) -> Vec<Vec<usize>> {
+        let Some(list) = &self.list else { return Vec::new() };
+        let mut rows: Vec<Vec<usize>> = list.sections.iter().map(|_| Vec::new()).collect();
+        let mut seen = HashSet::new();
+        let priorities = match self.list_view {
+            ListView::Grouped => [Some("snoozed"), Some("pinned"), None],
+            ListView::Simple => [Some("snoozed"), None, Some("pinned")],
+        };
+        for priority in priorities {
+            for (s, section) in list.sections.iter().enumerate() {
+                let group = match section.id.as_str() {
+                    "snoozed" => Some("snoozed"),
+                    "pinned" => Some("pinned"),
+                    _ => None,
+                };
+                if group != priority {
+                    continue;
+                }
+                if let Some(indices) = rows.get_mut(s) {
+                    indices.extend(section.threads.iter().enumerate().filter_map(|(r, row)| {
+                        let archived_pin = self.list_view == ListView::Simple
+                            && group == Some("pinned")
+                            && row.resolved_at.is_some()
+                            && !row.back_from_archive;
+                        (!archived_pin && self.matches_project(row) && seen.insert(row.thread_id.as_str()))
+                            .then_some(r)
+                    }));
+                }
             }
+        }
+        rows
+    }
+
+    fn update_places(&mut self) {
+        let Some(list) = &self.list else { return };
+        let mut present = HashSet::new();
+        for (s, indices) in self.section_rows.iter().enumerate() {
+            let Some(section) = list.sections.get(s).filter(|section| section.id != "snoozed") else {
+                continue;
+            };
+            for row in indices.iter().filter_map(|r| section.threads.get(*r)) {
+                let group = if section.id == "pinned" { &row.section } else { &section.id };
+                present.insert(row.thread_id.as_str());
+                if let Some(place) = self.places.get_mut(&row.thread_id) {
+                    if place.group != *group {
+                        place.group.clone_from(group);
+                        place.at.clone_from(&row.last_at);
+                    }
+                } else {
+                    self.places.insert(
+                        row.thread_id.clone(),
+                        ListPlace { group: group.clone(), at: row.last_at.clone() },
+                    );
+                }
+            }
+        }
+        self.places.retain(|id, _| present.contains(id.as_str()));
+    }
+
+    fn row_section(&self, id: &str) -> Option<usize> {
+        self.section_rows.iter().enumerate().find_map(|(s, rows)| {
+            rows.iter().any(|r| self.row_id(Entry::Row(s, *r)) == Some(id)).then_some(s)
+        })
+    }
+
+    pub(crate) fn row(&self, entry: Entry) -> Option<&super::client::Row> {
+        match entry {
+            Entry::Row(s, r) => self.list.as_ref()?.sections.get(s)?.threads.get(r),
             Entry::Header(_) => None,
         }
     }
 
+    fn row_id(&self, entry: Entry) -> Option<&str> {
+        self.row(entry).map(|row| row.thread_id.as_str())
+    }
+
+    pub(crate) fn is_pinned(&self, id: &str) -> bool {
+        self.pinned.contains(id)
+    }
+
+    fn toggle_list_view(&mut self) {
+        let keep = match self.selection() {
+            Some(Keep::Header(id)) if self.list_view == ListView::Grouped && id != "snoozed" => self
+                .list
+                .as_ref()
+                .and_then(|list| list.sections.iter().find(|section| section.id == id))
+                .and_then(|section| section.threads.iter().find(|row| self.matches_project(row)))
+                .map(|row| Keep::Row(row.thread_id.clone())),
+            selected => selected,
+        };
+        self.list_view = match self.list_view {
+            ListView::Grouped => ListView::Simple,
+            ListView::Simple => ListView::Grouped,
+        };
+        self.places.clear();
+        self.rebuild_entries(keep.as_ref());
+        if self.list_view == ListView::Grouped
+            && let Some(Keep::Row(id)) = &keep
+            && let Some(s) = self.row_section(id)
+            && let Some(section) = self.list.as_ref().and_then(|list| list.sections.get(s))
+            && self.collapsed.remove(&section.id)
+        {
+            self.rebuild_entries(keep.as_ref());
+        }
+    }
+
     pub(crate) fn context_thread_id(&self) -> Option<String> {
-        self.thread
-            .as_ref()
-            .map(|t| t.id().to_owned())
-            .or_else(|| self.entries.get(self.cursor).and_then(|entry| self.row_id(*entry)))
+        self.thread.as_ref().map(|t| t.id().to_owned()).or_else(|| {
+            self.entries.get(self.cursor).and_then(|entry| self.row_id(*entry)).map(str::to_owned)
+        })
     }
 
     fn matches_project(&self, row: &super::client::Row) -> bool {
@@ -359,6 +522,7 @@ impl Inbox {
         self.mode = Mode::List;
         self.cursor = 0;
         self.list_scroll = 0;
+        self.places.clear();
         self.rebuild_entries(None);
     }
 
@@ -370,6 +534,7 @@ impl Inbox {
         self.mode = Mode::List;
         self.cursor = 0;
         self.list_scroll = 0;
+        self.places.clear();
         self.rebuild_entries(None);
     }
 
@@ -425,7 +590,7 @@ impl Inbox {
                     Some(Entry::Header(s)) => self.toggle_section(s),
                     Some(entry @ Entry::Row(..)) => {
                         if let Some(id) = self.row_id(entry) {
-                            return vec![Request::Thread(id)];
+                            return vec![Request::Thread(id.to_owned())];
                         }
                     }
                     None => {}
@@ -436,7 +601,11 @@ impl Inbox {
                     self.collapse_section(s);
                 }
             }
-            KeyCode::Char('r' | 'R') => return vec![Request::List],
+            KeyCode::Char('v') => self.toggle_list_view(),
+            KeyCode::Char('r' | 'R') => {
+                self.places.clear();
+                return vec![Request::List];
+            }
             KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
             _ => {}
         }
@@ -458,6 +627,9 @@ impl Inbox {
         let Some(id) = self.list.as_ref().and_then(|l| l.sections.get(section)).map(|s| s.id.clone()) else {
             return;
         };
+        if self.list_view == ListView::Simple && id != "snoozed" {
+            return;
+        }
         self.collapsed.insert(id);
         self.cursor = self.entries.iter().position(|e| *e == Entry::Header(section)).unwrap_or(self.cursor);
         let keep = self.selection();
@@ -479,6 +651,9 @@ impl Inbox {
         self.thread = None;
         self.draft = None;
         self.mode = Mode::List;
+        let keep = self.selection();
+        self.places.clear();
+        self.rebuild_entries(keep.as_ref());
     }
 
     /// The unconfirmed Send of the open thread, if any.
@@ -949,12 +1124,11 @@ impl Inbox {
             title.push_str(&t.project.name);
             return title;
         }
-        let threads: usize =
-            self.list.as_ref().map_or(0, |l| l.sections.iter().map(|s| s.threads.len()).sum());
+        let threads: usize = self.section_rows.iter().map(Vec::len).sum();
         let filter = self.project_filter.as_deref().map_or(String::new(), |id| format!(" · project {id}"));
         let agent =
             self.agent_filter.as_ref().map_or(String::new(), |filter| format!(" · agent {}", filter.name));
-        format!("Inbox · {threads} threads{filter}{agent} · {}", self.url)
+        format!("Inbox · {} · {threads} threads{filter}{agent} · {}", self.list_view.label(), self.url)
     }
 }
 
@@ -1018,6 +1192,195 @@ mod tests {
 
     fn press(inbox: &mut Inbox, code: KeyCode) -> Vec<Request> {
         inbox.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn list_row(id: &str, hour: u8) -> super::super::client::Row {
+        super::super::client::Row {
+            thread_id: id.to_owned(),
+            subject: Some(id.to_owned()),
+            last_at: format!("2026-11-11T{hour:02}:00:00.000Z"),
+            ..super::super::client::Row::default()
+        }
+    }
+
+    fn list_model(groups: Vec<(&str, Vec<super::super::client::Row>)>) -> List {
+        List {
+            server_session: "fixture".to_owned(),
+            cursor: 0,
+            notice: None,
+            sections: groups
+                .into_iter()
+                .map(|(id, threads)| super::super::client::Section {
+                    id: id.to_owned(),
+                    label: id.to_owned(),
+                    threads,
+                })
+                .collect(),
+            pins: Vec::new(),
+            snoozed: Vec::new(),
+            agents: Vec::new(),
+            self_machine: None,
+        }
+    }
+
+    fn visible_ids(inbox: &Inbox) -> Vec<&str> {
+        inbox.entries.iter().filter_map(|entry| inbox.row_id(*entry)).collect()
+    }
+
+    #[test]
+    fn simple_list_includes_quiet_and_sent_once_and_keeps_snoozed_folded() {
+        let mut inbox = Inbox::new(String::new());
+        let mut archived = list_row("archived", 22);
+        archived.resolved_at = Some("2026-11-11T22:00:00.000Z".to_owned());
+        inbox.loaded_list(list_model(vec![
+            ("pinned", vec![list_row("star", 1), list_row("pin_only", 7), list_row("nap", 23), archived]),
+            ("waiting", vec![list_row("star", 8), list_row("nap", 23)]),
+            ("new", vec![list_row("b", 10), list_row("a", 10)]),
+            ("sent", vec![list_row("sent", 9)]),
+            ("quiet", vec![list_row("quiet", 11)]),
+            ("snoozed", vec![list_row("nap", 23)]),
+        ]));
+        assert_eq!(inbox.list_view, ListView::Grouped);
+        assert_eq!(visible_ids(&inbox), ["star", "pin_only", "archived", "b", "a", "sent"]);
+        assert!(press(&mut inbox, KeyCode::Char('v')).is_empty());
+        assert_eq!(visible_ids(&inbox), ["quiet", "a", "b", "sent", "star", "pin_only"]);
+        assert_eq!(inbox.entries.iter().filter(|entry| matches!(entry, Entry::Header(_))).count(), 1);
+        assert!(inbox.is_pinned("star"));
+        press(&mut inbox, KeyCode::End);
+        assert_eq!(inbox.selection(), Some(Keep::Header("snoozed".to_owned())));
+        press(&mut inbox, KeyCode::Enter);
+        assert_eq!(visible_ids(&inbox), ["quiet", "a", "b", "sent", "star", "pin_only", "nap"]);
+        press(&mut inbox, KeyCode::Down);
+        assert!(matches!(press(&mut inbox, KeyCode::Enter).as_slice(), [Request::Thread(id)] if id == "nap"));
+        press(&mut inbox, KeyCode::Left);
+        assert!(inbox.is_collapsed("snoozed"));
+    }
+
+    #[test]
+    fn simple_list_keeps_pinned_threads_that_returned_from_archive() {
+        let mut inbox = Inbox::new(String::new());
+        let mut returned = list_row("returned", 10);
+        returned.resolved_at = Some("2026-11-11T01:00:00.000Z".to_owned());
+        returned.back_from_archive = true;
+        let mut archived = list_row("archived", 11);
+        archived.resolved_at.clone_from(&returned.resolved_at);
+        inbox.loaded_list(list_model(vec![("pinned", vec![archived, returned])]));
+        press(&mut inbox, KeyCode::Char('v'));
+        assert_eq!(visible_ids(&inbox), ["returned"]);
+        assert!(inbox.is_pinned("returned"));
+        assert!(
+            matches!(press(&mut inbox, KeyCode::Enter).as_slice(), [Request::Thread(id)] if id == "returned")
+        );
+    }
+
+    #[test]
+    fn switching_views_preserves_selected_thread_and_local_read_only_state() {
+        let mut inbox = Inbox::new(String::new());
+        inbox.live = LiveState::Snapshot;
+        inbox.writes_ready = false;
+        inbox.body_height = 1;
+        inbox.loaded_list(list_model(vec![
+            ("new", vec![list_row("new", 2)]),
+            ("quiet", vec![list_row("quiet", 1)]),
+        ]));
+        assert!(press(&mut inbox, KeyCode::Char('v')).is_empty());
+        press(&mut inbox, KeyCode::End);
+        assert_eq!(inbox.selection(), Some(Keep::Row("quiet".to_owned())));
+        assert!(press(&mut inbox, KeyCode::Char('v')).is_empty());
+        assert_eq!(inbox.selection(), Some(Keep::Row("quiet".to_owned())));
+        assert!(!inbox.is_collapsed("quiet"));
+        assert_eq!(inbox.list_scroll, inbox.cursor);
+        assert!(press(&mut inbox, KeyCode::Char('v')).is_empty());
+        assert_eq!(inbox.selection(), Some(Keep::Row("quiet".to_owned())));
+        assert_eq!(inbox.live, LiveState::Snapshot);
+        assert!(!inbox.writes_ready);
+        let folds = inbox.collapsed.clone();
+        press(&mut inbox, KeyCode::Left);
+        assert_eq!(inbox.collapsed, folds);
+    }
+
+    #[test]
+    fn live_simple_rows_hold_their_order_but_update_content_and_admit_new_groups() {
+        let mut inbox = Inbox::new(String::new());
+        inbox.loaded_list(list_model(vec![("new", vec![list_row("a", 3), list_row("b", 1)])]));
+        press(&mut inbox, KeyCode::Char('v'));
+        press(&mut inbox, KeyCode::End);
+        assert!(matches!(inbox.live(Live::Refresh).as_slice(), [Request::List]));
+        let mut updated = list_row("b", 9);
+        updated.subject = Some("fresh title".to_owned());
+        updated.unread = true;
+        inbox.loaded_list(list_model(vec![("new", vec![updated, list_row("c", 5), list_row("a", 3)])]));
+        assert_eq!(visible_ids(&inbox), ["c", "a", "b"]);
+        assert_eq!(inbox.selection(), Some(Keep::Row("b".to_owned())));
+        let selected = inbox.row(inbox.entries[inbox.cursor]).expect("selected row");
+        assert_eq!(selected.subject.as_deref(), Some("fresh title"));
+        assert!(selected.unread);
+        inbox.loaded_list(list_model(vec![
+            ("new", vec![list_row("a", 3), list_row("c", 5)]),
+            ("quiet", vec![list_row("b", 9)]),
+        ]));
+        assert_eq!(visible_ids(&inbox), ["b", "c", "a"]);
+        assert_eq!(inbox.selection(), Some(Keep::Row("b".to_owned())));
+    }
+
+    #[test]
+    fn explicit_refresh_close_and_filter_changes_release_simple_list_order() {
+        let mut inbox = Inbox::new(String::new());
+        inbox.loaded_list(list_model(vec![("new", vec![list_row("a", 3), list_row("b", 1)])]));
+        press(&mut inbox, KeyCode::Char('v'));
+        inbox.loaded_list(list_model(vec![("new", vec![list_row("b", 9), list_row("a", 3)])]));
+        assert_eq!(visible_ids(&inbox), ["a", "b"]);
+        assert!(matches!(press(&mut inbox, KeyCode::Char('r')).as_slice(), [Request::List]));
+        inbox.loaded_list(list_model(vec![("new", vec![list_row("b", 9), list_row("a", 3)])]));
+        assert_eq!(visible_ids(&inbox), ["b", "a"]);
+        inbox.opened_thread(model("a", Vec::new()));
+        inbox.loaded_list(list_model(vec![("new", vec![list_row("a", 10), list_row("b", 9)])]));
+        assert_eq!(visible_ids(&inbox), ["b", "a"]);
+        press(&mut inbox, KeyCode::Esc);
+        assert_eq!(visible_ids(&inbox), ["a", "b"]);
+        inbox.loaded_list(list_model(vec![("new", vec![list_row("b", 11), list_row("a", 10)])]));
+        assert_eq!(visible_ids(&inbox), ["a", "b"]);
+        inbox.set_project_filter(None);
+        assert_eq!(visible_ids(&inbox), ["b", "a"]);
+        inbox.loaded_list(list_model(vec![("new", vec![list_row("a", 12), list_row("b", 11)])]));
+        inbox.set_agent_filter(None);
+        assert_eq!(visible_ids(&inbox), ["a", "b"]);
+        assert_eq!(inbox.list_view, ListView::Simple);
+    }
+
+    #[test]
+    fn returning_snoozed_band_is_folded_and_deleted_selection_is_clamped() {
+        let mut inbox = Inbox::new(String::new());
+        inbox.loaded_list(list_model(vec![("snoozed", vec![list_row("nap", 1)])]));
+        press(&mut inbox, KeyCode::Char('v'));
+        press(&mut inbox, KeyCode::Enter);
+        press(&mut inbox, KeyCode::Down);
+        inbox.loaded_list(list_model(Vec::new()));
+        assert!(inbox.entries.is_empty());
+        assert_eq!((inbox.cursor, inbox.list_scroll), (0, 0));
+        inbox.loaded_list(list_model(vec![("snoozed", vec![list_row("nap", 1)])]));
+        assert_eq!(inbox.entries, [Entry::Header(0)]);
+        assert!(inbox.is_collapsed("snoozed"));
+    }
+
+    #[test]
+    fn project_filter_applies_to_simple_rows_and_folded_counts() {
+        let mut inbox = Inbox::new(String::new());
+        let mut included = list_row("included", 2);
+        included.project.id = "project".to_owned();
+        inbox.loaded_list(list_model(vec![
+            ("quiet", vec![included.clone(), list_row("excluded", 3)]),
+            ("snoozed", vec![list_row("other", 4)]),
+        ]));
+        press(&mut inbox, KeyCode::Char('v'));
+        inbox.set_project_filter(Some("project".to_owned()));
+        assert_eq!(visible_ids(&inbox), ["included"]);
+        assert_eq!(inbox.section_rows.iter().map(Vec::len).collect::<Vec<_>>(), [1, 0]);
+        assert_eq!(inbox.entries.len(), 1);
+        included.last_at = "2026-11-11T20:00:00.000Z".to_owned();
+        inbox.loaded_list(list_model(vec![("sent", vec![included]), ("new", vec![list_row("other", 22)])]));
+        assert_eq!(visible_ids(&inbox), ["included"]);
+        assert_eq!(inbox.selection(), Some(Keep::Row("included".to_owned())));
     }
 
     #[test]

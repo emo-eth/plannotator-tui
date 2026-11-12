@@ -121,16 +121,24 @@ plannotator-tui inbox --snapshot 120 40
 ```
 
 In the list, use `j`/`k` or arrow keys to move, `Enter` to open a thread or fold a section,
-and `q` to quit. **`F2` opens the feature menu; `?` or `F1` opens keyboard help.** `/` opens
+`v` to switch between Smart groups and Simple list for this session, and `q` to quit.
+**`F2` opens the feature menu; `?` or `F1` opens keyboard help.** `/` opens
 server-backed search and `L` opens session controls. The feature menu works on the selected
 list row or open thread; entries needing a thread say so when no thread is selected.
 
 The menu includes Board, sessions/terminal/permissions, attachments, message notes, question
 references, pull requests, guided reviews, thread actions, search, decisions, agents,
 projects, Ask AI, reply drafts, artifacts, Shapes/System, media, machines/outbox, history,
-sharing/export, settings, agent icons, and updates. Each pane shows its own controls.
+sharing/export, settings, guided tour, product feedback, agent icons, and updates. Each pane shows its own controls.
 Board and PR panes keep refreshing from the event stream while open. Project and agent
 filters apply to the main thread list; clear them in their corresponding feature pane.
+
+Product feedback is submitted only after an explicit preview and confirmation. Related-help
+matching is local; the full upstream issue, PR and release-title search is not included.
+
+The guided tour replays fixture threads locally. Its explicitly labeled appearance and tour-status
+actions change Inbox settings; image and video playback requires `ffmpeg`. The tour shows HTML
+prototype source, not an interactive preview.
 
 In a thread, `Tab` moves between question cards, arrows select a choice, and `Enter` saves
 the pick. Use `o` for Other, `t` for a text answer, `N` for a note, and `x` to clear a pick.
